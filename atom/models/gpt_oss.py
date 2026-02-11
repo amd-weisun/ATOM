@@ -43,9 +43,16 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from torch import nn
 from transformers import GptOssConfig
+
+# AllReduce + RMSNorm fusion: when enabled, AllReduce is deferred from
+# RowParallelLinear/FusedMoE and fused into the subsequent RMSNorm layer.
+# This reduces kernel launch overhead and memory traffic.
+# Enable via: ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=1 (default: 1)
+ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 
 
 def cdiv(x, y):
@@ -108,12 +115,15 @@ class OAIAttention(nn.Module):
             bias=True,
         )
 
+        # When ENABLE_ALLREDUCE_RMSNORM_FUSION is True, skip AllReduce here
+        # and let the subsequent RMSNorm layer handle it (fused operation)
         self.o_proj = RowParallelLinear(
             input_size=self.num_attention_heads * self.head_dim,
             output_size=self.hidden_size,
             quant_config=None,
             prefix=f"{prefix}.o_proj",
             bias=True,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
         self.num_local_attention_heads = config.num_attention_heads // tp_size
@@ -171,12 +181,14 @@ class MLPBlock(torch.nn.Module):
             prefix=f"{prefix}.gate",
         )
         assert config.intermediate_size % self.world_size == 0
+        # When ENABLE_ALLREDUCE_RMSNORM_FUSION is True, skip AllReduce here
+        # and let the subsequent RMSNorm layer handle it (fused operation)
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            reduce_results=True,
+            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
             renormalize=True,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -213,6 +225,11 @@ class TransformerBlock(torch.nn.Module):
 
         self.layer_idx = layer_num
         self.hidden_size = atom_config.hf_config.hidden_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+        # Track if this layer uses fused allreduce (needed for final norm handling)
+        self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
+
         self.self_attn = OAIAttention(
             config,
             prefix=f"{prefix}.self_attn",
@@ -221,9 +238,22 @@ class TransformerBlock(torch.nn.Module):
             layer_num=layer_num,
         )
         self.mlp = MLPBlock(atom_config, self.layer_idx, prefix=f"{prefix}.mlp")
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
+
+        # input_layernorm: fused_allreduce handles the AllReduce from the
+        # previous layer's MoE output. Skip for layer 0 (no previous layer).
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=1e-5,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and layer_num > 0,
+        )
+
+        # post_attention_layernorm: fused_allreduce handles the AllReduce
+        # from this layer's attention O projection output.
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=1e-5, x_pad_to_multiple=256
+            config.hidden_size,
+            eps=1e-5,
+            x_pad_to_multiple=256,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
     def forward(
@@ -273,7 +303,20 @@ class GptOssModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(self.config.hidden_size, eps=1e-5)
+
+        # Final norm: if ENABLE_ALLREDUCE_RMSNORM_FUSION is on, the last layer's
+        # MoE output has not been reduced yet. The final norm must handle it.
+        # Check if the last layer uses fused allreduce.
+        last_layer_fuse_ar = (
+            self.layers[self.end_layer - 1].fuse_ar_input_norm
+            if self.end_layer > 0 and hasattr(self.layers[self.end_layer - 1], "fuse_ar_input_norm")
+            else False
+        )
+        self.norm = RMSNorm(
+            self.config.hidden_size,
+            eps=1e-5,
+            fused_allreduce=last_layer_fuse_ar,
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.config.hidden_size
         )
