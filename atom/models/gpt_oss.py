@@ -115,15 +115,16 @@ class OAIAttention(nn.Module):
             bias=True,
         )
 
-        # When ENABLE_ALLREDUCE_RMSNORM_FUSION is True, skip AllReduce here
-        # and let the subsequent RMSNorm layer handle it (fused operation)
+        # Note: Cannot use AllReduce+RMSNorm fusion for O projection because
+        # post_attention_layernorm uses x_pad_to_multiple=256, which is
+        # incompatible with fused_allreduce. AllReduce must happen here.
         self.o_proj = RowParallelLinear(
             input_size=self.num_attention_heads * self.head_dim,
             output_size=self.hidden_size,
             quant_config=None,
             prefix=f"{prefix}.o_proj",
             bias=True,
-            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            reduce_results=True,  # Must reduce here (padding incompatible with fusion)
         )
 
         self.num_local_attention_heads = config.num_attention_heads // tp_size
@@ -247,13 +248,14 @@ class TransformerBlock(torch.nn.Module):
             fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and layer_num > 0,
         )
 
-        # post_attention_layernorm: fused_allreduce handles the AllReduce
-        # from this layer's attention O projection output.
+        # post_attention_layernorm: Note that fused_allreduce is NOT compatible
+        # with x_pad_to_multiple, so we cannot use fusion here.
+        # The AllReduce from O projection must happen in o_proj itself.
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=1e-5,
             x_pad_to_multiple=256,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            fused_allreduce=False,  # Cannot use fusion with padding
         )
 
     def forward(
