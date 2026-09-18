@@ -2192,7 +2192,18 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
     def _process_weight_layout_after_loading(self, layer) -> None:
         from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
 
-        if self._hybrid_enabled:
+        # Whenever `apply()` can end up on the standard masked-local
+        # `fused_moe()` fallback -- either because hybrid dispatch may pick
+        # it, or because `init_prepare_finalize` falls back to it outright
+        # when no real all-to-all is engaged (use_all2all_kernels=False,
+        # e.g. dp_size<=1, see init_prepare_finalize below) -- the standard
+        # shuffled layer.w13_weight/w2_weight must survive weight loading.
+        # Otherwise they're freed to torch.empty(0, ...) below and the
+        # fallback kernel crashes trying to read shapes off them.
+        needs_standard_weights = (
+            self._hybrid_enabled or not self.moe.moe_parallel_config.use_all2all_kernels
+        )
+        if needs_standard_weights:
             # On gfx950 with is_guinterleave=True, mega's and standard's
             # weight-shuffle transforms are byte-identical, so _mega_* can
             # alias the standard-shuffled tensors instead of duplicating them.
@@ -2204,10 +2215,12 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
                 layer._mega_w2 = layer.w2_weight.data
                 layer._mega_w2_scale = layer.w2_weight_scale.data
                 logger.info(
-                    "Prepared MegaMoE weights for fused MoE layer (hybrid: "
-                    "_mega_* aliased onto the standard layout, no duplicate "
-                    "weight memory -- is_guinterleave=True, arch=%s)",
+                    "Prepared MegaMoE weights for fused MoE layer (standard "
+                    "layout kept: _mega_* aliased onto it, no duplicate "
+                    "weight memory -- is_guinterleave=True, arch=%s, "
+                    "hybrid_enabled=%s)",
                     "gfx1250" if self.is_gfx1250 else "gfx9xx",
+                    self._hybrid_enabled,
                 )
             else:
                 # Layouts differ: build_mega_weights needs the raw,
@@ -2216,12 +2229,14 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
                 build_mega_weights(layer)
                 super()._process_weight_layout_after_loading(layer)
                 logger.warning(
-                    "Prepared MegaMoE weights for fused MoE layer (hybrid: "
-                    "mega and standard layouts differ under this config "
-                    "[is_guinterleave=%s, gfx1250=%s] -- both copies retained, "
-                    "full extra weight memory paid)",
+                    "Prepared MegaMoE weights for fused MoE layer (standard "
+                    "layout kept: mega and standard layouts differ under "
+                    "this config [is_guinterleave=%s, gfx1250=%s] -- both "
+                    "copies retained, full extra weight memory paid, "
+                    "hybrid_enabled=%s)",
                     self.is_guinterleave,
                     self.is_gfx1250,
+                    self._hybrid_enabled,
                 )
             return
 
@@ -2257,6 +2272,32 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             self.fused_experts = None
         else:
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+
+        # Mega's own dispatch/combine always performs a full, already-complete
+        # EP-group-wide combine internally, regardless of dp_size -- unlike the
+        # standard path above, which only builds a real cross-rank MoRI
+        # dispatch/combine when moe_parallel_config.use_all2all_kernels is True,
+        # and otherwise leaves self.fused_experts as None so `apply()` falls
+        # back to the masked-local-experts `fused_moe()` kernel (a genuine
+        # partial per-rank sum). `MoE.combine_outputs` in the model always
+        # all-reduces whenever the *real* physical TP group size is >1,
+        # blind to which path produced its input -- correct for that partial
+        # sum, but a second (wrongly duplicating) reduction on top of mega's
+        # already-complete result whenever a real all2all wasn't actually
+        # engaged (e.g. TP-only EP with dp_size<=1, where the "EP group" and
+        # the "TP group" are the same ranks). Gate mega on the same condition
+        # standard already uses so both fall back identically in that regime.
+        use_all2all_kernels = self.moe.moe_parallel_config.use_all2all_kernels
+        if not use_all2all_kernels:
+            self.fused_experts = standard_experts
+            logger.info(
+                "MegaMoE: no real all-to-all is engaged for this parallel "
+                "config (use_all2all_kernels=False, e.g. dp_size<=1) -- "
+                "falling back to the masked-local-experts path instead of "
+                "mega's dispatch/combine, to stay compatible with "
+                "combine_outputs' tp-size-gated all-reduce."
+            )
+            return
 
         mega_experts = MegaFusedExperts(
             layer,
