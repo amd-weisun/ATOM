@@ -191,6 +191,36 @@ def _load_cached_layer(path: str, cfg, dev):
     return W, packed
 
 
+_DRAFT_LAYERS: dict[str, tuple] = {}
+
+
+def _draft_layer_op(hidden_states: torch.Tensor, positions: torch.Tensor, layer_name: str) -> torch.Tensor:
+    """Draft-model decoder layer + shared_head.norm.  An opaque custom op so the compiled MTP model keeps a
+    single graph (a graph break would trip the one-graph compile backend).  Steps the kernel does not cover
+    (the draft's prefill pass, unsupported shapes) run ATOM's own ``mtp_block`` eagerly here."""
+    mega, layer = _DRAFT_LAYERS[layer_name]
+    out = mega.draft_layer(layer, hidden_states, positions)
+    if out is None:
+        hs, residual = layer.mtp_block(positions=positions, hidden_states=hidden_states, residual=None)
+        out, _ = layer.shared_head.norm(hs, residual)
+    return out
+
+
+def _draft_layer_op_fake(hidden_states: torch.Tensor, positions: torch.Tensor, layer_name: str) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+from atom.utils.custom_register import direct_register_custom_op  # noqa: E402
+
+direct_register_custom_op(
+    op_name="dsv3_mega_draft_layer",
+    op_func=_draft_layer_op,
+    mutates_args=(),
+    fake_impl=_draft_layer_op_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 class DSV3MegaKernel:
     """Per-rank owner of the kernel layers; ``forward`` replaces the model body for covered decode steps."""
 
@@ -362,8 +392,10 @@ class DSV3MegaKernel:
         if not self.has_draft:
             return
         predictor = draft_model.model
-        for layer in predictor.layers.values():
-            layer._dsv3_mega_draft = self
+        for idx, layer in predictor.layers.items():
+            name = f"dsv3_mega_draft_{idx}"
+            _DRAFT_LAYERS[name] = (self, layer)
+            layer._dsv3_mega_draft_name = name
         logger.info("[dsv3-mega] MTP draft layer attached (%d kernel variants)", len(self.draft_by_sq))
 
     def _draft_pool(self, layer) -> torch.Tensor:
@@ -379,7 +411,6 @@ class DSV3MegaKernel:
             pool = self._kv_pools[("draft", id(layer))] = kv.view(-1, KV_LORA + PE_DIM)
         return pool
 
-    @torch.compiler.disable
     def draft_layer(self, layer, h: torch.Tensor, positions: torch.Tensor):
         """Draft-model decoder layer (``mtp_block``) + ``shared_head.norm`` on the kernel.
 
