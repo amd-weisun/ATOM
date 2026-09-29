@@ -184,6 +184,9 @@ class DSV3MegaKernel:
     def _load_layers(self, config):
         ck = _Checkpoint(config.model)
         t0 = time.perf_counter()
+        # 8 ranks x default (~all cores) intra-op threads oversubscribe the node: 4x slower loads
+        prev_threads = torch.get_num_threads()
+        torch.set_num_threads(4)
         first_by_s: dict[int, SharedReuseMlaMoeLayer] = {}
         for li in range(self.first, self.n_layers):
             W = load_layer_weights(ck, self.hf, li, self.rank, self.tp, self.dev)
@@ -215,6 +218,7 @@ class DSV3MegaKernel:
                 logger.info(
                     "[dsv3-mega] layer %d/%d loaded (%.0fs)", li, self.n_layers - 1, time.perf_counter() - t0
                 )
+        torch.set_num_threads(prev_threads)
         logger.info("[dsv3-mega] rank %d: %d layers ready in %.0fs", self.rank, self.n_layers - self.first, time.perf_counter() - t0)
 
     # --------------------------------------------------------------- dispatch
