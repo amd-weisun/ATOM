@@ -36,6 +36,7 @@ try:  # the kernels live in the FlyDSL checkout (``kernels`` package)
 except ImportError:  # pragma: no cover - reported when the feature is enabled
     SharedReuseMlaMoeLayer = None
 
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tp_group
 
 logger = __import__("logging").getLogger("atom")
@@ -165,6 +166,9 @@ class DSV3MegaKernel:
         attn = self.model.layers[self.first].self_attn
         self.softmax_scale = float(attn.scaling)
         self.eps = float(hf.rms_norm_eps)
+        # ATOM defers each layer's TP all-reduce into the next layer's fused AR+RMSNorm, so the
+        # dense layers hand over an UNREDUCED partial; the kernel returns a fully reduced output
+        self.defer_ar = bool(self.model.layers[self.first].input_layernorm.fused_allreduce) and self.tp > 1
         cos = attn.rotary_emb.cos_cache
         sin = attn.rotary_emb.sin_cache
         self.cos = cos.reshape(cos.shape[0], -1).float().contiguous().to(self.dev)
@@ -246,7 +250,7 @@ class DSV3MegaKernel:
         residual = None
         for i in range(self.first):
             hs, residual = m.layers[i](positions, hs, residual)
-        h = hs + residual
+        h = (tensor_model_parallel_all_reduce(hs) if self.defer_ar else hs) + residual
         md = get_forward_context().attn_metadata
         pos32 = positions.to(torch.int32)
         slot32 = md.slot_mapping[:S].to(torch.int32)
@@ -262,7 +266,10 @@ class DSV3MegaKernel:
                 h, pos32, self._pool(li), slot32, indptr, indices, self.cos, self.sin, layer=li - self.first,
                 advance=(li == last),
             )
-        return m.norm(h)
+        # plain RMSNorm: ``h`` is already reduced (m.norm would all-reduce it again)
+        x = h.float()
+        y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps) * m.norm.weight.float()
+        return y.to(h.dtype)
 
     # ------------------------------------------------------------------ debug
     def _checked_layer(self, li, op, positions, hs, residual, h, pos32, slot32, indptr, indices):
@@ -270,7 +277,9 @@ class DSV3MegaKernel:
 
         Both write the same new-token KV row (idempotent); ATOM's result is discarded."""
         ref_hs, ref_res = self.model.layers[li](positions, hs, residual)
-        ref = (ref_hs.float() + ref_res.float())
+        if self.defer_ar:
+            ref_hs = tensor_model_parallel_all_reduce(ref_hs)
+        ref = ref_hs.float() + ref_res.float()
         out = op.forward_paged(
             h, pos32, self._pool(li), slot32, indptr, indices, self.cos, self.sin, layer=0, advance=False
         )
