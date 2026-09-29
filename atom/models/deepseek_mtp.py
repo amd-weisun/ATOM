@@ -138,6 +138,12 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             )
             hidden_states = self.eh_proj(eh_input)
 
+        mega = getattr(self, "_dsv3_mega_draft", None)
+        if mega is not None:
+            # DeepSeek-V3 MTP draft layer on the FlyDSL mega kernel (ATOM_DSV3_MEGAKERNEL=1); None = not covered
+            mega_out = mega.draft_layer(self, hidden_states, positions)
+            if mega_out is not None:
+                return mega_out
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )

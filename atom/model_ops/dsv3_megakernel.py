@@ -231,6 +231,10 @@ class DSV3MegaKernel:
         # (S total tokens, Q tokens per sequence) -> one kernel layer per MoE layer
         self.variants = [(S, Q) for Q in self.qs for S in SUPPORTED_S if S % Q == 0]
         self.by_sq: dict[tuple[int, int], list] = {v: [] for v in self.variants}
+        # MTP draft layer (the checkpoint's layer ``num_hidden_layers``): same shape as a target MoE layer
+        self.has_draft = spec is not None and bool(spec.num_speculative_tokens)
+        self.draft_by_sq: dict[tuple[int, int], SharedReuseMlaMoeLayer] = {}
+        self.draft_stats: dict = {}
         self._load_layers(config)
         self._kv_pools: dict[int, torch.Tensor] = {}
         self._zero_res: dict[int, torch.Tensor] = {}
@@ -245,7 +249,8 @@ class DSV3MegaKernel:
         first_by_v: dict[tuple[int, int], SharedReuseMlaMoeLayer] = {}
         cdir = _cache_dir(config, self.tp, self.rank)
         n_hit = 0
-        for li in range(self.first, self.n_layers):
+        layer_ids = list(range(self.first, self.n_layers)) + ([self.n_layers] if self.has_draft else [])
+        for li in layer_ids:
             cpath = os.path.join(cdir, f"layer{li}.safetensors") if cdir else None
             packed0 = None
             if cpath is not None and os.path.exists(cpath):
@@ -277,16 +282,19 @@ class DSV3MegaKernel:
                 if base is None:
                     base = op
                 first_by_v.setdefault((S, Q), op)
-                self.by_sq[(S, Q)].append(op)
+                if li == self.n_layers:
+                    self.draft_by_sq[(S, Q)] = op
+                else:
+                    self.by_sq[(S, Q)].append(op)
             if cpath is not None and packed0 is None:
                 _save_layer(cpath, W, base.packed)
             torch.cuda.synchronize()
-            if self.rank == 0 and (li - self.first) % 8 == 0:
+            if self.rank == 0 and (li - self.first) % 8 == 0 and li < self.n_layers:
                 logger.info(
                     "[dsv3-mega] layer %d/%d loaded (%.0fs)", li, self.n_layers - 1, time.perf_counter() - t0
                 )
         torch.set_num_threads(prev_threads)
-        logger.info("[dsv3-mega] rank %d: %d layers ready in %.0fs (%d from the packed-weight cache)", self.rank, self.n_layers - self.first, time.perf_counter() - t0, n_hit)
+        logger.info("[dsv3-mega] rank %d: %d layers ready in %.0fs (%d from the packed-weight cache)", self.rank, len(layer_ids), time.perf_counter() - t0, n_hit)
 
     # --------------------------------------------------------------- dispatch
     def applies(self, positions: torch.Tensor, intermediate_tensors, inputs_embeds) -> bool:
@@ -347,6 +355,75 @@ class DSV3MegaKernel:
         x = h.float()
         y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps) * m.norm.weight.float()
         return y.to(h.dtype)
+
+    # ------------------------------------------------------------- MTP draft
+    def attach_draft(self, draft_model) -> None:
+        """Route the draft model's MTP layer through the kernel (call once the drafter is built)."""
+        if not self.has_draft:
+            return
+        predictor = draft_model.model
+        for layer in predictor.layers.values():
+            layer._dsv3_mega_draft = self
+        logger.info("[dsv3-mega] MTP draft layer attached (%d kernel variants)", len(self.draft_by_sq))
+
+    def _draft_pool(self, layer) -> torch.Tensor:
+        pool = self._kv_pools.get(("draft", id(layer)))
+        if pool is None:
+            kv = next(
+                kc
+                for mod in layer.mtp_block.self_attn.modules()
+                if isinstance(kc := getattr(mod, "kv_cache", None), torch.Tensor) and kc.dim() == 3
+            )
+            want = torch.float8_e4m3fn if self.kv_fp8 else torch.bfloat16
+            assert kv.dtype == want and kv.shape[-1] == KV_LORA + PE_DIM, (kv.dtype, kv.shape)
+            pool = self._kv_pools[("draft", id(layer))] = kv.view(-1, KV_LORA + PE_DIM)
+        return pool
+
+    @torch.compiler.disable
+    def draft_layer(self, layer, h: torch.Tensor, positions: torch.Tensor):
+        """Draft-model decoder layer (``mtp_block``) + ``shared_head.norm`` on the kernel.
+
+        ``h`` is the ``eh_proj`` output.  Returns the post-shared_head-norm hidden, or None when this step
+        is not covered (prefill / unsupported shape) so the caller runs ATOM's own layer."""
+        ctx = get_forward_context()
+        c, md = ctx.context, ctx.attn_metadata
+        if c is None or c.is_prefill or md is None or md.kv_indptr is None or md.kv_indices is None:
+            return None
+        if md.slot_mapping is None:
+            return None
+        S = positions.shape[0]
+        Q = int(md.max_seqlen_q) or 1
+        op = self.draft_by_sq.get((S, Q))
+        key = (S, Q, torch.cuda.is_current_stream_capturing())
+        if key not in self.draft_stats:
+            self.draft_stats[key] = 1
+            if self.rank == 0:
+                logger.info(
+                    "[dsv3-mega][draft] S=%d Q=%d capturing=%s covered=%s scheduled_bs=%s running_bs=%s",
+                    S, Q, key[2], op is not None, getattr(c, "scheduled_bs", None), getattr(c, "running_bs", None),
+                )
+        if op is None:
+            return None
+        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)  # padded rows, see forward()
+        pos32 = positions.to(torch.int32)
+        slot32 = md.slot_mapping[:S].to(torch.int32)
+        indptr = md.kv_indptr[: S // Q + 1]
+        out = op.forward_paged(
+            h, pos32, self._draft_pool(layer), slot32, indptr, md.kv_indices, self.cos, self.sin,
+            layer=self.n_layers - self.first, advance=True,
+        )
+        if self.check and not torch.cuda.is_current_stream_capturing():
+            ref_hs, ref_res = layer.mtp_block(positions=positions, hidden_states=h, residual=None)
+            if self.defer_ar:
+                ref_hs = tensor_model_parallel_all_reduce(ref_hs)
+            ref = ref_hs.float() + ref_res.float()
+            torch.cuda.synchronize()
+            rel = ((out.float() - ref).norm() / ref.norm()).item()
+            logger.info("[dsv3-mega][draft][check] S=%d Q=%d rank %d: mega vs ATOM mtp_block rel_l2=%.3e", S, Q, self.rank, rel)
+        norm = layer.shared_head.norm
+        x = out.float()
+        y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps) * norm.weight.float()
+        return y.to(out.dtype)
 
     # ------------------------------------------------------------------ debug
     def _checked_layer(self, li, op, positions, hs, residual, h, pos32, slot32, indptr, indices):

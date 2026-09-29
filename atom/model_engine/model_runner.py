@@ -758,6 +758,8 @@ class ModelRunner:
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
+            if _mega is not None:
+                _mega.attach_draft(self.drafter.model)
             # NOTE: aux-hidden-state capture is armed AFTER the optional TBO wrap
             # below, so the drafter's capture hook lands on the object whose
             # forward returns the final (concatenated) output. See arm_aux_capture.
