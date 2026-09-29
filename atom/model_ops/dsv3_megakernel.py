@@ -257,6 +257,10 @@ class DSV3MegaKernel:
         for i in range(self.first):
             hs, residual = m.layers[i](positions, hs, residual)
         h = (tensor_model_parallel_all_reduce(hs) if self.defer_ar else hs) + residual
+        # Padded rows of a graph batch (real bs 3/5/6/7 padded to 4/8) went through ATOM's attention over an
+        # EMPTY context and can be NaN/Inf.  The kernel is not NaN-tolerant across samples (one non-finite
+        # row turns every real row's output NaN), and ATOM's per-row layers never notice.  Zero them.
+        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
         md = get_forward_context().attn_metadata
         pos32 = positions.to(torch.int32)
         slot32 = md.slot_mapping[:S].to(torch.int32)
