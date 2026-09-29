@@ -225,7 +225,12 @@ class DSV3MegaKernel:
         self.sin = sin.reshape(sin.shape[0], -1).float().contiguous().to(self.dev)
         assert self.cos.shape[1] == PE_DIM // 2
         self.group = tp.cpu_group
-        self.by_s: dict[int, list] = {s: [] for s in SUPPORTED_S}
+        # speculative decoding verifies Q = k+1 tokens per sequence per step; plain decode is Q = 1
+        spec = getattr(config, "speculative_config", None)
+        self.qs = (1,) + ((spec.num_speculative_tokens + 1,) if spec is not None and spec.num_speculative_tokens else ())
+        # (S total tokens, Q tokens per sequence) -> one kernel layer per MoE layer
+        self.variants = [(S, Q) for Q in self.qs for S in SUPPORTED_S if S % Q == 0]
+        self.by_sq: dict[tuple[int, int], list] = {v: [] for v in self.variants}
         self._load_layers(config)
         self._kv_pools: dict[int, torch.Tensor] = {}
         self._zero_res: dict[int, torch.Tensor] = {}
@@ -237,7 +242,7 @@ class DSV3MegaKernel:
         # 8 ranks x default (~all cores) intra-op threads oversubscribe the node: 4x slower loads
         prev_threads = torch.get_num_threads()
         torch.set_num_threads(4)
-        first_by_s: dict[int, SharedReuseMlaMoeLayer] = {}
+        first_by_v: dict[tuple[int, int], SharedReuseMlaMoeLayer] = {}
         cdir = _cache_dir(config, self.tp, self.rank)
         n_hit = 0
         for li in range(self.first, self.n_layers):
@@ -249,7 +254,7 @@ class DSV3MegaKernel:
             else:
                 W = load_layer_weights(ck, self.hf, li, self.rank, self.tp, self.dev)
             base = None
-            for S in SUPPORTED_S:
+            for S, Q in self.variants:
                 op = SharedReuseMlaMoeLayer(
                     W,
                     S,
@@ -262,16 +267,17 @@ class DSV3MegaKernel:
                     topk_groups=self.hf.topk_group,
                     paged=True,
                     kv_fp8=self.kv_fp8,
+                    q_per_seq=Q,
                     eps=self.eps,
                     softmax_scale=self.softmax_scale,
                     free_unpacked=(base is None and packed0 is None),
-                    reuse=first_by_s.get(S),
+                    reuse=first_by_v.get((S, Q)),
                     packed=packed0 if base is None else base.packed,
                 )
                 if base is None:
                     base = op
-                first_by_s.setdefault(S, op)
-                self.by_s[S].append(op)
+                first_by_v.setdefault((S, Q), op)
+                self.by_sq[(S, Q)].append(op)
             if cpath is not None and packed0 is None:
                 _save_layer(cpath, W, base.packed)
             torch.cuda.synchronize()
@@ -293,7 +299,7 @@ class DSV3MegaKernel:
         md = ctx.attn_metadata
         if md is None or md.kv_indptr is None or md.kv_indices is None or md.slot_mapping is None:
             return False
-        return positions.shape[0] in SUPPORTED_S
+        return (positions.shape[0], int(md.max_seqlen_q) or 1) in self.by_sq
 
     def _pool(self, idx: int) -> torch.Tensor:
         pool = self._kv_pools.get(idx)
@@ -312,6 +318,7 @@ class DSV3MegaKernel:
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         m = self.model
         S = positions.shape[0]
+        Q = int(get_forward_context().attn_metadata.max_seqlen_q) or 1
         hs = m.get_input_embeddings(input_ids)
         residual = None
         for i in range(self.first):
@@ -324,11 +331,11 @@ class DSV3MegaKernel:
         md = get_forward_context().attn_metadata
         pos32 = positions.to(torch.int32)
         slot32 = md.slot_mapping[:S].to(torch.int32)
-        indptr = md.kv_indptr[: S + 1]
+        indptr = md.kv_indptr[: S // Q + 1]  # one entry per SEQUENCE
         indices = md.kv_indices
         last = self.n_layers - 1
         for li in range(self.first, self.n_layers):
-            op = self.by_s[S][li - self.first]
+            op = self.by_sq[(S, Q)][li - self.first]
             if self.check and li == self.first and not torch.cuda.is_current_stream_capturing():
                 h = self._checked_layer(li, op, positions, hs, residual, h, pos32, slot32, indptr, indices)
                 continue
