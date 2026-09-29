@@ -207,7 +207,8 @@ class DSV3MegaKernel:
         self.dev = torch.device("cuda", torch.cuda.current_device())
         assert hf.n_routed_experts == N_EXPERTS and hf.n_shared_experts == 1, "kernel is fixed to 256+1 experts"
         assert hf.scoring_func == "sigmoid" and hf.norm_topk_prob and hf.routed_scaling_factor == 2.5
-        assert config.kv_cache_dtype == "bf16", "the kernel reads/writes a bf16 MLA cache: use --kv_cache_dtype bf16"
+        assert config.kv_cache_dtype in ("bf16", "fp8"), "the kernel reads/writes a bf16 or fp8 (unit-scale e4m3) MLA cache"
+        self.kv_fp8 = config.kv_cache_dtype == "fp8"
         spl = envs.ATOM_DSV3_MEGAKERNEL_SPLITS
         # 64 splits win at batch<=4 (up to ~1.8x at 128K ctx); at batch 8 the 512 split tasks overflow the 256 CTAs
         self.splits = {S: (64 if S <= 4 else 32) if spl == "auto" else int(spl) for S in SUPPORTED_S}
@@ -260,6 +261,7 @@ class DSV3MegaKernel:
                     n_groups=self.hf.n_group,
                     topk_groups=self.hf.topk_group,
                     paged=True,
+                    kv_fp8=self.kv_fp8,
                     eps=self.eps,
                     softmax_scale=self.softmax_scale,
                     free_unpacked=(base is None and packed0 is None),
@@ -301,7 +303,8 @@ class DSV3MegaKernel:
                 for mod in self.model.layers[idx].self_attn.modules()
                 if isinstance(kc := getattr(mod, "kv_cache", None), torch.Tensor) and kc.dim() == 3
             )
-            assert kv.dtype == torch.bfloat16 and kv.shape[-1] == KV_LORA + PE_DIM, (kv.dtype, kv.shape)
+            want = torch.float8_e4m3fn if self.kv_fp8 else torch.bfloat16
+            assert kv.dtype == want and kv.shape[-1] == KV_LORA + PE_DIM, (kv.dtype, kv.shape)
             pool = self._kv_pools[idx] = kv.view(-1, KV_LORA + PE_DIM)
         return pool
 
