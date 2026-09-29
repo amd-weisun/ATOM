@@ -291,7 +291,19 @@ class DSV3MegaKernel:
         )
         torch.cuda.synchronize()
         rel = ((out.float() - ref).norm() / ref.norm()).item()
-        logger.info("[dsv3-mega][check] layer %d rank %d: mega vs ATOM layer rel_l2=%.3e", li, self.rank, rel)
+        kv_lens = (indptr[1:] - indptr[:-1]).tolist()
+        logger.info(
+            "[dsv3-mega][check] layer %d rank %d S=%d kv_len=%s: mega vs ATOM layer rel_l2=%.3e",
+            li, self.rank, positions.shape[0], kv_lens, rel,
+        )
+        if self.rank == 0 and not getattr(self, "_dumped", False) and max(kv_lens) > 64:
+            self._dumped = True
+            n = kv_lens[0]
+            logger.info(
+                "[dsv3-mega][meta] pos=%s slot=%s indptr=%s idx[:6]=%s idx[-6:]=%s dtype(indices)=%s pool_rows=%d",
+                pos32.tolist(), slot32.tolist(), indptr.tolist(), indices[:6].tolist(),
+                indices[n - 6 : n].tolist(), indices.dtype, self._pool(li).shape[0],
+            )
         return out
 
 
