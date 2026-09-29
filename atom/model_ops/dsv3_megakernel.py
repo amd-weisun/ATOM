@@ -259,7 +259,7 @@ class DSV3MegaKernel:
         last = self.n_layers - 1
         for li in range(self.first, self.n_layers):
             op = self.by_s[S][li - self.first]
-            if self.check and li == self.first:
+            if self.check and li == self.first and not torch.cuda.is_current_stream_capturing():
                 h = self._checked_layer(li, op, positions, hs, residual, h, pos32, slot32, indptr, indices)
                 continue
             h = op.forward_paged(
