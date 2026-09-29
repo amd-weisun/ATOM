@@ -337,7 +337,17 @@ class DSV3MegaKernel:
         md = ctx.attn_metadata
         if md is None or md.kv_indptr is None or md.kv_indices is None or md.slot_mapping is None:
             return False
+        if not self._kv_ready():
+            return False  # engine warmup runs before the KV cache is allocated
         return (positions.shape[0], int(md.max_seqlen_q) or 1) in self.by_sq
+
+    def _kv_ready(self) -> bool:
+        if not getattr(self, "_kv_bound", False):
+            self._kv_bound = any(
+                isinstance(kc := getattr(mod, "kv_cache", None), torch.Tensor) and kc.dim() == 3
+                for mod in self.model.layers[self.first].self_attn.modules()
+            )
+        return self._kv_bound
 
     def _pool(self, idx: int) -> torch.Tensor:
         pool = self._kv_pools.get(idx)
@@ -402,10 +412,15 @@ class DSV3MegaKernel:
         pool = self._kv_pools.get(("draft", id(layer)))
         if pool is None:
             kv = next(
-                kc
-                for mod in layer.mtp_block.self_attn.modules()
-                if isinstance(kc := getattr(mod, "kv_cache", None), torch.Tensor) and kc.dim() == 3
+                (
+                    kc
+                    for mod in layer.mtp_block.self_attn.modules()
+                    if isinstance(kc := getattr(mod, "kv_cache", None), torch.Tensor) and kc.dim() == 3
+                ),
+                None,
             )
+            if kv is None:  # engine warmup runs before the KV cache is allocated
+                return None
             want = torch.float8_e4m3fn if self.kv_fp8 else torch.bfloat16
             assert kv.dtype == want and kv.shape[-1] == KV_LORA + PE_DIM, (kv.dtype, kv.shape)
             pool = self._kv_pools[("draft", id(layer))] = kv.view(-1, KV_LORA + PE_DIM)
@@ -435,12 +450,15 @@ class DSV3MegaKernel:
                 )
         if op is None:
             return None
+        pool = self._draft_pool(layer)
+        if pool is None:
+            return None
         h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)  # padded rows, see forward()
         pos32 = positions.to(torch.int32)
         slot32 = md.slot_mapping[:S].to(torch.int32)
         indptr = md.kv_indptr[: S // Q + 1]
         out = op.forward_paged(
-            h, pos32, self._draft_pool(layer), slot32, indptr, md.kv_indices, self.cos, self.sin,
+            h, pos32, pool, slot32, indptr, md.kv_indices, self.cos, self.sin,
             layer=self.n_layers - self.first, advance=True,
         )
         if self.check and not torch.cuda.is_current_stream_capturing():
