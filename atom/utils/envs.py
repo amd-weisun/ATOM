@@ -112,6 +112,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DeepSeek-V3/R1 decode through the FlyDSL MLA+MoE mega kernel (see model_ops/dsv3_megakernel.py)
     "ATOM_DSV3_MEGAKERNEL": lambda: os.getenv("ATOM_DSV3_MEGAKERNEL", "0") == "1",
+    # node-local cache of the kernel's packed weights (skips the strided checkpoint reads on repeat launches); "" disables
+    "ATOM_DSV3_MEGAKERNEL_CACHE": lambda: os.getenv("ATOM_DSV3_MEGAKERNEL_CACHE", "/root/mega_cache"),
     # parallel KV splits per decode sample for the mega kernel, "auto" = 64 for batch<=4 and 32 for 8
     # (context length itself is unbounded, up to the model's max_model_len)
     "ATOM_DSV3_MEGAKERNEL_SPLITS": lambda: os.getenv("ATOM_DSV3_MEGAKERNEL_SPLITS", "auto"),

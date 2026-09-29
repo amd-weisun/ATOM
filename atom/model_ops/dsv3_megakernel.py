@@ -20,6 +20,8 @@ i.e. ``--kv_cache_dtype bf16``), addressed with ATOM's own ``kv_indptr``/``kv_in
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import os
 import time
@@ -144,6 +146,51 @@ def load_layer_weights(ck: _Checkpoint, cfg, layer: int, tp_rank: int, tp: int, 
     return LayerWeights(H, t, hidden=hidden, q_lora=q_lora, nope_dim=nope, v_dim=v_dim)
 
 
+def _cache_dir(config, tp: int, rank: int) -> str | None:
+    """Node-local cache of this rank's PACKED layer weights (``ATOM_DSV3_MEGAKERNEL_CACHE``, "" disables).
+
+    Repeat launches then read ~1.4 GB/layer of packed tensors from local disk / page cache instead of doing
+    strided checkpoint reads + packing (which alone took 3-13 min/launch, worst on rank 0).  The key hashes
+    everything the packed bytes depend on, so a packing or loader change starts a fresh cache."""
+    root = envs.ATOM_DSV3_MEGAKERNEL_CACHE
+    if not root:
+        return None
+    import kernels.mla_moe_layer.packing as packing
+
+    h = hashlib.sha256()
+    h.update(inspect.getsource(packing).encode())
+    h.update(inspect.getsource(load_layer_weights).encode())
+    h.update(f"{config.model}|tp{tp}".encode())
+    d = os.path.join(root, f"{os.path.basename(config.model.rstrip('/'))}_tp{tp}_{h.hexdigest()[:12]}", f"rank{rank}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _save_layer(path: str, W, packed: dict) -> None:
+    from safetensors.torch import save_file
+
+    tensors = {f"t.{k}": v.contiguous().cpu() for k, v in W.t.items()}
+    tensors.update({f"p.{k}": v.contiguous().cpu() for k, v in packed.items()})
+    tmp = f"{path}.tmp{os.getpid()}"
+    save_file(tensors, tmp, metadata={"heads": str(W.heads)})
+    os.replace(tmp, path)
+
+
+def _load_cached_layer(path: str, cfg, dev):
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    with safe_open(path, framework="pt") as f:
+        heads = int(f.metadata()["heads"])
+    raw = load_file(path, device=str(dev))
+    t = {k[2:]: v for k, v in raw.items() if k.startswith("t.")}
+    packed = {k[2:]: v for k, v in raw.items() if k.startswith("p.")}
+    W = LayerWeights(
+        heads, t, hidden=cfg.hidden_size, q_lora=cfg.q_lora_rank, nope_dim=cfg.qk_nope_head_dim, v_dim=cfg.v_head_dim
+    )
+    return W, packed
+
+
 class DSV3MegaKernel:
     """Per-rank owner of the kernel layers; ``forward`` replaces the model body for covered decode steps."""
 
@@ -190,8 +237,16 @@ class DSV3MegaKernel:
         prev_threads = torch.get_num_threads()
         torch.set_num_threads(4)
         first_by_s: dict[int, SharedReuseMlaMoeLayer] = {}
+        cdir = _cache_dir(config, self.tp, self.rank)
+        n_hit = 0
         for li in range(self.first, self.n_layers):
-            W = load_layer_weights(ck, self.hf, li, self.rank, self.tp, self.dev)
+            cpath = os.path.join(cdir, f"layer{li}.safetensors") if cdir else None
+            packed0 = None
+            if cpath is not None and os.path.exists(cpath):
+                W, packed0 = _load_cached_layer(cpath, self.hf, self.dev)
+                n_hit += 1
+            else:
+                W = load_layer_weights(ck, self.hf, li, self.rank, self.tp, self.dev)
             base = None
             for S in SUPPORTED_S:
                 op = SharedReuseMlaMoeLayer(
@@ -207,21 +262,23 @@ class DSV3MegaKernel:
                     paged=True,
                     eps=self.eps,
                     softmax_scale=self.softmax_scale,
-                    free_unpacked=(base is None),
+                    free_unpacked=(base is None and packed0 is None),
                     reuse=first_by_s.get(S),
-                    packed=None if base is None else base.packed,
+                    packed=packed0 if base is None else base.packed,
                 )
                 if base is None:
                     base = op
                 first_by_s.setdefault(S, op)
                 self.by_s[S].append(op)
+            if cpath is not None and packed0 is None:
+                _save_layer(cpath, W, base.packed)
             torch.cuda.synchronize()
             if self.rank == 0 and (li - self.first) % 8 == 0:
                 logger.info(
                     "[dsv3-mega] layer %d/%d loaded (%.0fs)", li, self.n_layers - 1, time.perf_counter() - t0
                 )
         torch.set_num_threads(prev_threads)
-        logger.info("[dsv3-mega] rank %d: %d layers ready in %.0fs", self.rank, self.n_layers - self.first, time.perf_counter() - t0)
+        logger.info("[dsv3-mega] rank %d: %d layers ready in %.0fs (%d from the packed-weight cache)", self.rank, self.n_layers - self.first, time.perf_counter() - t0, n_hit)
 
     # --------------------------------------------------------------- dispatch
     def applies(self, positions: torch.Tensor, intermediate_tensors, inputs_embeds) -> bool:
