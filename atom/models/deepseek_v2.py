@@ -3285,6 +3285,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                     pcp_pad_dense(inputs_embeds, n_pad), pcp_ws
                 )
 
+        mega = getattr(self, "_dsv3_mega", None)
+        if mega is not None and not pcp and mega.applies(
+            positions, intermediate_tensors, inputs_embeds
+        ):
+            # DeepSeek-V3 decode step covered by the FlyDSL mega kernel (eager here; captured
+            # into ATOM's CUDA graph like any other decode forward)
+            return mega.forward(input_ids, positions)
+
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )

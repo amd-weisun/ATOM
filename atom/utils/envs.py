@@ -110,6 +110,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
+    # DeepSeek-V3/R1 decode through the FlyDSL MLA+MoE mega kernel (see model_ops/dsv3_megakernel.py)
+    "ATOM_DSV3_MEGAKERNEL": lambda: os.getenv("ATOM_DSV3_MEGAKERNEL", "0") == "1",
+    # longest context the mega kernel attends over (multiple of 64); longer contexts are not supported
+    "ATOM_DSV3_MEGAKERNEL_MAX_CTX": lambda: int(os.getenv("ATOM_DSV3_MEGAKERNEL_MAX_CTX", "2048")),
+    # run ATOM's own first mega layer alongside the kernel and log the difference (debug)
+    "ATOM_DSV3_MEGAKERNEL_CHECK": lambda: os.getenv("ATOM_DSV3_MEGAKERNEL_CHECK", "0") == "1",
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
     ),
