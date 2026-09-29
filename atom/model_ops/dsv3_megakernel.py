@@ -161,7 +161,9 @@ class DSV3MegaKernel:
         assert hf.n_routed_experts == N_EXPERTS and hf.n_shared_experts == 1, "kernel is fixed to 256+1 experts"
         assert hf.scoring_func == "sigmoid" and hf.norm_topk_prob and hf.routed_scaling_factor == 2.5
         assert config.kv_cache_dtype == "bf16", "the kernel reads/writes a bf16 MLA cache: use --kv_cache_dtype bf16"
-        self.topk = envs.ATOM_DSV3_MEGAKERNEL_MAX_CTX
+        spl = envs.ATOM_DSV3_MEGAKERNEL_SPLITS
+        # 64 splits win at batch<=4 (up to ~1.8x at 128K ctx); at batch 8 the 512 split tasks overflow the 256 CTAs
+        self.splits = {S: (64 if S <= 4 else 32) if spl == "auto" else int(spl) for S in SUPPORTED_S}
         self.check = envs.ATOM_DSV3_MEGAKERNEL_CHECK
         attn = self.model.layers[self.first].self_attn
         self.softmax_scale = float(attn.scaling)
@@ -198,7 +200,7 @@ class DSV3MegaKernel:
                     rank=self.rank,
                     npes=self.tp,
                     group=self.group,
-                    topk=self.topk,
+                    topk=self.splits[S] * 64,
                     moe_mode="w8a8",
                     n_groups=self.hf.n_group,
                     topk_groups=self.hf.topk_group,

@@ -112,8 +112,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DeepSeek-V3/R1 decode through the FlyDSL MLA+MoE mega kernel (see model_ops/dsv3_megakernel.py)
     "ATOM_DSV3_MEGAKERNEL": lambda: os.getenv("ATOM_DSV3_MEGAKERNEL", "0") == "1",
-    # longest context the mega kernel attends over (multiple of 64); longer contexts are not supported
-    "ATOM_DSV3_MEGAKERNEL_MAX_CTX": lambda: int(os.getenv("ATOM_DSV3_MEGAKERNEL_MAX_CTX", "2048")),
+    # parallel KV splits per decode sample for the mega kernel, "auto" = 64 for batch<=4 and 32 for 8
+    # (context length itself is unbounded, up to the model's max_model_len)
+    "ATOM_DSV3_MEGAKERNEL_SPLITS": lambda: os.getenv("ATOM_DSV3_MEGAKERNEL_SPLITS", "auto"),
     # run ATOM's own first mega layer alongside the kernel and log the difference (debug)
     "ATOM_DSV3_MEGAKERNEL_CHECK": lambda: os.getenv("ATOM_DSV3_MEGAKERNEL_CHECK", "0") == "1",
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
