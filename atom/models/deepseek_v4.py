@@ -4888,6 +4888,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
         else:
             ctx.context.input_ids = input_ids
+        mega = getattr(self, "_dsv4_mega", None)
+        if mega is not None and not use_pcp and mega.applies(positions):
+            # a decode step the FlyDSL megakernel covers: every covered layer is one
+            # launch over ATOM's own caches and state (model_ops/dsv4_megakernel.py)
+            return mega.forward(input_ids, positions)
         h = self.model(input_ids, positions)
 
         # ----- PCP: all-gather shards, restore original order, drop pad -----

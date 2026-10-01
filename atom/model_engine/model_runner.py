@@ -772,6 +772,14 @@ class ModelRunner:
 
         self._build_and_load_model(model_class)
 
+        # Optional DeepSeek-V4 decode megakernel (ATOM_DSV4_MEGAKERNEL=1); loads its own
+        # packed weights from the checkpoint, so it must run before the KV budget is measured.
+        from atom.model_ops.dsv4_megakernel import maybe_build as _dsv4_mega_build
+
+        _mega = _dsv4_mega_build(self.model, config)
+        if _mega is not None:
+            self.model._dsv4_mega = _mega
+
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
         from atom.utils.debug_helper import (
