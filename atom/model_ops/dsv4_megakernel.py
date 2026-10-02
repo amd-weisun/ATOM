@@ -55,9 +55,12 @@ from aiter.dist.parallel_state import get_tp_group
 logger = __import__("logging").getLogger("atom")
 
 SUPPORTED_S = (1, 2, 4, 8)
-# launches a verify step may be split into (each takes up to SUPPORTED_S[-1] tokens and
-# its own epoch-tag slots, layer + g * n_layers: see MAX_LAYERS_PER_STEP)
-MTP_GROUPS = 4
+# Launches a verify step may be split into, each of up to SUPPORTED_S[-1] tokens with its
+# own epoch-tag slots (layer + g * n_layers: see MAX_LAYERS_PER_STEP). The kernel supports
+# 4, but each launch re-streams the layer's weights: MTP-3 at 1M max-len measured TPOT
+# 1.95x / 1.55x ATOM's at c1 / c2 (one launch) and 0.88x / 0.56x at c4 / c8 (two / four).
+# So larger steps go to ATOM's own path.
+MTP_MAX_LAUNCHES = 1
 
 
 def _cache_dir(config, tp: int, rank: int) -> str | None:
@@ -233,9 +236,9 @@ class DSV4MegaKernel:
             return False
         if getattr(self.model.layers[self.layer_ids[0]].attn, "unified_kv", None) is None:
             return False  # engine warmup runs before the KV cache is bound
-        if self.tok > 1:  # a verify step: whole runs of K + 1 tokens, up to MTP_GROUPS launches
+        if self.tok > 1:  # a verify step: whole runs of K + 1 tokens, up to MTP_MAX_LAUNCHES launches
             T = positions.shape[0]
-            return md.max_seqlen_q == self.tok and T % self.tok == 0 and T <= SUPPORTED_S[-1] * MTP_GROUPS
+            return md.max_seqlen_q == self.tok and T % self.tok == 0 and T <= SUPPORTED_S[-1] * MTP_MAX_LAUNCHES
         return positions.shape[0] <= SUPPORTED_S[-1]
 
     # ---------------------------------------------------------------- inputs
