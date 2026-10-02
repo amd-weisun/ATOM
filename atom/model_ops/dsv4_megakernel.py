@@ -61,6 +61,11 @@ SUPPORTED_S = (1, 2, 4, 8)
 # 1.95x / 1.55x ATOM's at c1 / c2 (one launch) and 0.88x / 0.56x at c4 / c8 (two / four).
 # So larger steps go to ATOM's own path.
 MTP_MAX_LAUNCHES = 1
+# Tokens one verify launch may take. The kernel runs S = 16 in one launch (FlyDSL 2286b64),
+# but at MTP-3 c4 that measured TPOT 0.91x ATOM's (5.87 / 5.34 ms, 1M max-len) against ~parity
+# on ATOM's own path, so 16-token steps stay on ATOM until the S = 16 layer is faster
+# (its qkv_a runs two sample groups serially: ~43 us of a 278 us CSA layer).
+MTP_MAX_S = 8
 
 
 def _cache_dir(config, tp: int, rank: int) -> str | None:
@@ -127,7 +132,9 @@ class DSV4MegaKernel:
         # a step of more is split into launches of whole sequences.
         self.tok = 1 + k_spec
         assert self.tok in (1, 2, 4, 8), f"num_speculative_tokens {k_spec}: runs must tile the 8-sample launch"
-        self.sizes = tuple(self.tok * n for n in (1, 2, 4, 8) if self.tok * n <= SUPPORTED_S[-1])
+        # a verify step goes to the kernel as one launch of up to MTP_MAX_S tokens
+        self.max_s = MTP_MAX_S if self.tok > 1 else SUPPORTED_S[-1]
+        self.sizes = tuple(self.tok * n for n in (1, 2, 4, 8, 16) if self.tok * n <= self.max_s)
         assert not self.model.enable_res_preshuffle, "the preshuffled mHC residual (gfx1250) is not covered"
         self.hc = hf.hc_mult
         self.max_seq = config.max_model_len
@@ -238,7 +245,7 @@ class DSV4MegaKernel:
             return False  # engine warmup runs before the KV cache is bound
         if self.tok > 1:  # a verify step: whole runs of K + 1 tokens, up to MTP_MAX_LAUNCHES launches
             T = positions.shape[0]
-            return md.max_seqlen_q == self.tok and T % self.tok == 0 and T <= SUPPORTED_S[-1] * MTP_MAX_LAUNCHES
+            return md.max_seqlen_q == self.tok and T % self.tok == 0 and T <= self.max_s * MTP_MAX_LAUNCHES
         return positions.shape[0] <= SUPPORTED_S[-1]
 
     # ---------------------------------------------------------------- inputs
@@ -292,7 +299,7 @@ class DSV4MegaKernel:
         md = get_forward_context().attn_metadata
         T = positions.shape[0]
         tok = self.tok
-        S = T if T <= SUPPORTED_S[-1] else SUPPORTED_S[-1]
+        S = T if T <= self.max_s else self.max_s
         G = T // S
         self.calls[T] = self.calls.get(T, 0) + 1
         if self.rank == 0 and self.calls[T] in (1, 10, 100, 1000, 10000):
