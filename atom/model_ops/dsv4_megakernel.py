@@ -55,6 +55,9 @@ from aiter.dist.parallel_state import get_tp_group
 logger = __import__("logging").getLogger("atom")
 
 SUPPORTED_S = (1, 2, 4, 8)
+# launches a verify step may be split into (each takes up to SUPPORTED_S[-1] tokens and
+# its own epoch-tag slots, layer + g * n_layers: see MAX_LAYERS_PER_STEP)
+MTP_GROUPS = 4
 
 
 def _cache_dir(config, tp: int, rank: int) -> str | None:
@@ -112,7 +115,16 @@ class DSV4MegaKernel:
         self.dev = torch.device("cuda", torch.cuda.current_device())
         assert config.kv_cache_dtype == "fp8", "the kernel reads and writes ATOM's fp8 KV layout: --kv_cache_dtype fp8"
         spec = getattr(config, "speculative_config", None)
-        assert spec is None or not spec.num_speculative_tokens, "MTP is not covered yet"
+        k_spec = spec.num_speculative_tokens if spec is not None and spec.num_speculative_tokens else 0
+        if k_spec:
+            assert spec.method == "mtp", f"only MTP's rectangular verify step is covered, not {spec.method}"
+        # With MTP every decode step verifies K + 1 tokens per sequence (ATOM's
+        # DECODE state, positions p0 .. p0 + K). The kernel takes a sequence's tokens
+        # as a run of consecutive samples (tokens_per_seq), at most 8 per launch, so
+        # a step of more is split into launches of whole sequences.
+        self.tok = 1 + k_spec
+        assert self.tok in (1, 2, 4, 8), f"num_speculative_tokens {k_spec}: runs must tile the 8-sample launch"
+        self.sizes = tuple(self.tok * n for n in (1, 2, 4, 8) if self.tok * n <= SUPPORTED_S[-1])
         assert not self.model.enable_res_preshuffle, "the preshuffled mHC residual (gfx1250) is not covered"
         self.hc = hf.hc_mult
         self.max_seq = config.max_model_len
@@ -164,7 +176,7 @@ class DSV4MegaKernel:
         prev_threads = torch.get_num_threads()
         torch.set_num_threads(4)  # 8 ranks x all cores oversubscribe the node
         self.variants: dict[tuple[int, int], Dsv4Variant] = {}
-        self.by_s: dict[int, list] = {S: [] for S in SUPPORTED_S}
+        self.by_s: dict[int, list] = {S: [] for S in self.sizes}
         self.ratio_of = []
         cdir = _cache_dir(config, self.tp, self.rank)
         n_hit = 0
@@ -182,12 +194,13 @@ class DSV4MegaKernel:
             cfg.validate()
             self.ratio_of.append(cfg.compress_ratio)
             base = None
-            for S in SUPPORTED_S:
+            for S in self.sizes:
                 key = (cfg.compress_ratio, S)
                 if key not in self.variants:
                     self.variants[key] = Dsv4Variant(
                         cfg, S, rank=self.rank, npes=self.tp, group=self.group, moe_mode=MoeMode.A8W4,
                         allow_unindexed_csa=True,  # a stale guard: the indexer runs in-kernel
+                        tokens_per_seq=self.tok,
                     )
                 op = Dsv4MoeLayer(
                     W, S, rank=self.rank, npes=self.tp, group=self.group, moe_mode=MoeMode.A8W4,
@@ -220,6 +233,9 @@ class DSV4MegaKernel:
             return False
         if getattr(self.model.layers[self.layer_ids[0]].attn, "unified_kv", None) is None:
             return False  # engine warmup runs before the KV cache is bound
+        if self.tok > 1:  # a verify step: whole runs of K + 1 tokens, up to MTP_GROUPS launches
+            T = positions.shape[0]
+            return md.max_seqlen_q == self.tok and T % self.tok == 0 and T <= SUPPORTED_S[-1] * MTP_GROUPS
         return positions.shape[0] <= SUPPORTED_S[-1]
 
     # ---------------------------------------------------------------- inputs
@@ -263,7 +279,102 @@ class DSV4MegaKernel:
         return st
 
     # ---------------------------------------------------------------- forward
+    def _forward_mtp(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """A verify step: T = running_bs * (K + 1) tokens, sequence i's at rows
+        [i * (K + 1), (i + 1) * (K + 1)) with consecutive positions. Every per-token
+        input is ATOM's own (positions, write rows, key lists); per-sequence ones
+        (state slot, block table) are gathered through batch_id_per_q_token. The
+        step runs as launches of whole sequences, at most 8 tokens each."""
+        m = self.model
+        md = get_forward_context().attn_metadata
+        T = positions.shape[0]
+        tok = self.tok
+        S = T if T <= SUPPORTED_S[-1] else SUPPORTED_S[-1]
+        G = T // S
+        self.calls[T] = self.calls.get(T, 0) + 1
+        if self.rank == 0 and self.calls[T] in (1, 10, 100, 1000, 10000):
+            logger.info(
+                "[dsv4-mega] MTP verify steps on the kernel (tokens: count): %s (capturing: %s)",
+                self.calls, torch.cuda.is_current_stream_capturing(),
+            )
+        # CUDA-graph padding (batch id -1) comes in whole sequences: each padding token
+        # becomes a copy of sequence 0's token at the same offset in its run, so a
+        # padding run is sequence 0's run -- the same values over the same rows.
+        bid = md.batch_id_per_q_token[:T]
+        ar = torch.arange(T, device=self.dev)
+        src = torch.where(bid >= 0, ar, ar % tok)
+        seq = bid[src].long()
+        self._pos = positions[:T].to(torch.int32).contiguous()
+        pos = self._pos[src].contiguous()
+        tokens = input_ids[:T].to(torch.int32)[src].contiguous()
+        slots = md.state_slot_out[seq].to(torch.int32).contiguous()
+        bt = md.block_tables[seq].to(torch.int32).contiguous()
+        env = int(md.envelope_rows)
+        ops = self.by_s[S]
+        if not getattr(self, "_rings_checked", False):
+            # ATOM widens the rolling-state rings by K under MTP (8 + K, 128 + K); the
+            # kernel's C_RING is the same. The states are bound with the KV cache, after
+            # the layers load, so this is checked on the first verify step.
+            for i, li in enumerate(self.layer_ids):
+                comp = getattr(m.layers[li].attn, "compressor", None)
+                if comp is not None:
+                    want = ops[i].W.cfg.c_rows + tok - 1
+                    assert comp.kv_state.shape[1] == want, (
+                        f"layer {li}: compressor state has {comp.kv_state.shape[1]} rows, the kernel's ring {want}"
+                    )
+            self._rings_checked = True
+        rows = {}
+        for i, li in enumerate(self.layer_ids):
+            r = self.ratio_of[i]
+            if r not in rows:
+                cfg = ops[i].W.cfg
+                dest = torch.stack(
+                    [md.swa_dest_rows[r][:T].to(torch.int32)[src], torch.zeros(T, dtype=torch.int32, device=self.dev)]
+                )
+                rows[r] = (dest.contiguous(), self._index_rows(md, r, T, cfg.n_keys, cfg.window)[src].contiguous())
+        h = m.embed(input_ids[:T])[src]
+        h = h.unsqueeze(1).repeat(1, self.hc, 1).contiguous()
+        for i, li in enumerate(self.layer_ids):
+            attn = m.layers[li].attn
+            dest, idx = rows[self.ratio_of[i]]
+            cos, sin = self.table_of[i]
+            outs = []
+            for g in range(G):
+                sl = slice(g * S, (g + 1) * S)
+                outs.append(
+                    ops[i].forward(
+                        h[sl].contiguous(),
+                        pos[sl],
+                        (attn.unified_kv.view(torch.uint8), attn.unified_kv_rope),
+                        dest[:, sl].contiguous(),
+                        idx[sl],
+                        cos,
+                        sin,
+                        layer=li + g * self.n_layers,
+                        advance=False,
+                        tokens=tokens[sl],
+                        block_tables=bt[sl],
+                        env_rows=env,
+                        state=self._state(li, slots[sl]),
+                    )
+                )
+            h = outs[0] if G == 1 else torch.cat(outs)
+        for (r, s), var in self.variants.items():
+            if s == S:
+                var.advance_step()
+        if len(self.layer_ids) == self.n_layers:
+            return h
+        from atom.models.deepseek_v4 import HCState
+
+        hc_state = HCState(residual=h, post_mix=None, comb_mix=None, x_prev=None, res_preshuffle=False)
+        for li in range(len(self.layer_ids), self.n_layers):
+            hc_state = m.layers[li](hc_state, positions)
+        return m.layers[-1].hc_post(hc_state.x_prev, hc_state.residual, hc_state.post_mix, hc_state.comb_mix)
+
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if self.tok > 1:
+            assert not self.check, "ATOM_DSV4_MEGAKERNEL_CHECK covers the single-token decode step only"
+            return self._forward_mtp(input_ids, positions)
         m = self.model
         md = get_forward_context().attn_metadata
         S = positions.shape[0]
