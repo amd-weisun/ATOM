@@ -307,6 +307,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", "0") == "1"
     ),
+    # DeepSeek-V4 decode through the FlyDSL megakernel (see model_ops/dsv4_megakernel.py)
+    "ATOM_DSV4_MEGAKERNEL": lambda: os.getenv("ATOM_DSV4_MEGAKERNEL", "0") == "1",
+    # put only the first K layers on the kernel (0 = all): a memory budget, or a bisect
+    "ATOM_DSV4_MEGAKERNEL_LAYERS": lambda: int(
+        os.getenv("ATOM_DSV4_MEGAKERNEL_LAYERS", "0")
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
