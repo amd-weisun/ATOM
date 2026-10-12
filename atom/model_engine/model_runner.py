@@ -148,6 +148,8 @@ mono_decode_installers = {
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
     ),
+    # qwen_mono_bench: the FlyDSL Qwen3.5 MonoKernel (QWEN_MONO=1; otherwise the model is untouched)
+    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5_mono.install_mono_decode",
 }
 
 

@@ -20,6 +20,7 @@ from atom.model_config.qwen3_next import Qwen3NextConfig
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.models import _qwen_capture
 from atom.model_ops.layernorm import DualRMSNorm, GemmaRMSNorm, RMSNormGated
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
 from atom.model_ops.linear import (
@@ -825,6 +826,19 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if _qwen_capture.timing(self) and not getattr(self, "_capturing", False):
+            self._capturing = True
+            try:
+                return _qwen_capture.time_run(self, self.forward, positions, hidden_states, residual)
+            finally:
+                self._capturing = False
+        if _qwen_capture.enabled(self) and not getattr(self, "_capturing", False):
+            # qwen_mono_bench: capture this decode step for the MonoKernel equivalence check
+            self._capturing = True
+            try:
+                return _qwen_capture.run(self, self.forward, positions, hidden_states, residual)
+            finally:
+                self._capturing = False
         # Self Attention
         if self.input_layernorm.use_fused_quant:
             if residual is None:
