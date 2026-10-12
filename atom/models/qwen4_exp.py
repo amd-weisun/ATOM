@@ -4,6 +4,8 @@ from typing import ClassVar
 
 import numpy as np
 import torch
+
+from atom.models import _qwen38_capture
 from aiter import QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
@@ -675,6 +677,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
         """Fused: returns `(streams, pending)` where `pending` is this layer's
         MLP combine, deferred into the next hyper-connection. Unfused: returns
         the streams; the MTP drafter runs its single layer this way."""
+        if _qwen38_capture.enabled(self) and self.fused_hc and not getattr(self, "_capturing", False):
+            # qwen_mono_bench: capture this decode step for the MonoKernel equivalence check
+            self._capturing = True
+            try:
+                return _qwen38_capture.run(self, self.forward, positions, hidden_states, input_ids, pending)
+            finally:
+                self._capturing = False
         if not self.fused_hc:
             return self._forward_unfused(positions, hidden_states, input_ids)
         if self.ple is not None:
