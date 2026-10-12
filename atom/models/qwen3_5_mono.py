@@ -26,9 +26,9 @@ MAX_ROWS = 8
 
 
 def _lm(model):
-    """The module holding embed_tokens / layers / norm."""
+    """The module holding embed_tokens / layers (/ norm)."""
     for m in model.modules():
-        if all(hasattr(m, a) for a in ("embed_tokens", "layers", "norm")):
+        if all(hasattr(m, a) for a in ("embed_tokens", "layers")):
             return m
     raise RuntimeError("no embed_tokens / layers / norm in the model")
 
@@ -249,11 +249,21 @@ def _dump_weights(model, out):
         for n, t in list(lm.layers[i].named_parameters()) + list(lm.layers[i].named_buffers()):
             meta.append(f"L{i} {n} {tuple(t.shape)} {t.dtype} {t.stride()}")
             keep[f"L{i}.{n}"] = (t[:4] if "experts.w" in n else t).detach().cpu().clone()
+    for n, t in list(lm.named_parameters()) + list(lm.named_buffers()):
+        if not n.startswith("layers."):
+            meta.append(f"top {n} {tuple(t.shape)} {t.dtype} {t.stride()}")
     os.makedirs(out, exist_ok=True)
     torch.save(keep, f"{out}/r{rank}.pt")
     if rank == 0:
         open(f"{out}/meta.txt", "w").write("\n".join(meta))
     logger.info("Qwen3.5 weights dumped to %s", out)
+
+
+def install_weight_dump(model, atom_config, drafter, metadata_builder):
+    """Qwen3.8 (bench): only the QWEN_DUMP_WEIGHTS layout dump, no MonoKernel yet."""
+    if os.environ.get("QWEN_DUMP_WEIGHTS"):
+        _dump_weights(model, os.environ["QWEN_DUMP_WEIGHTS"])
+    return model
 
 
 def install_mono_decode(model, atom_config, drafter, metadata_builder):

@@ -150,6 +150,7 @@ mono_decode_installers = {
     ),
     # qwen_mono_bench: the FlyDSL Qwen3.5 MonoKernel (QWEN_MONO=1; otherwise the model is untouched)
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5_mono.install_mono_decode",
+    "Qwen4ExpForConditionalGeneration": "atom.models.qwen4_exp_mono.install_mono_decode",
 }
 
 
