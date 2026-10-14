@@ -79,3 +79,34 @@ Reference values (TP4, FP8 KV Cache, MTP-1):
 |gsm8k|      3|flexible-extract|     3|exact_match|↑  |0.8613|±  |0.0095|
 |     |       |strict-match    |     3|exact_match|↑  |0.8484|±  |0.0099|
 ```
+
+## Fused decode (mono)
+
+On a TP4 deployment with fp8 KV cache (the commands above), every decoder layer of a decode step of up to 16
+rows runs as one persistent kernel launch (`atom/models/qwen3_5/mono/`): the Gated DeltaNet or gated full
+attention, the MoE with its shared expert, and both TP all-reduces. A plain decode serves up to 16 requests;
+an MTP verify serves whole requests (MTP-3: up to 4), on ReplaySSM or the snapshot GDN state. The MTP draft's
+decoder layer runs on the same kernel. FP8 and MXFP4 checkpoints are both supported. It is on by default;
+`ATOM_MONO_ENABLE=0` turns it off. Wider steps, prefill and any other deployment keep the original path; the
+conditions are listed under `ATOM_MONO_ENABLE` in the
+[environment variable guide](../docs/environment_variables.md).
+
+Median TPOT on MI355X (TP4, fp8 KV, `--no-enable_prefix_caching`, ISL 8192 / OSL 1024, the client of
+`.github/scripts/atom_test.sh`; the original path is the same server with `ATOM_MONO_ENABLE=0`):
+
+| Checkpoint | Concurrency | Original | Mono | Speedup |
+|---|---|---|---|---|
+| FP8 | 1 | 7.73 ms | 2.12 ms | 3.65x |
+| FP8 | 4 | 8.68 ms | 3.84 ms | 2.26x |
+| FP8 | 8 | 10.06 ms | 6.14 ms | 1.64x |
+| FP8 | 16 | 13.68 ms | 11.16 ms | 1.23x |
+| FP8, MTP-3 | 1 | 2.57 ms | 1.46 ms | 1.76x |
+| FP8, MTP-3 | 4 | 3.54 ms | 2.90 ms | 1.22x |
+| MXFP4 | 1 | 6.72 ms | 2.50 ms | 2.69x |
+| MXFP4 | 4 | 7.90 ms | 3.90 ms | 2.03x |
+| MXFP4 | 8 | 9.50 ms | 5.83 ms | 1.63x |
+| MXFP4 | 16 | 12.41 ms | 11.31 ms | 1.10x |
+
+MTP-3 at 8 and 16 requests verifies 32 and 64 rows a step, which the original path runs. GSM8K 3-shot
+(flexible-extract, the accuracy CI's server) is at parity: FP8 0.8749 / 0.8628 (mono / original, 65 concurrent
+requests), MTP-3 0.8741 / 0.8757 with acceptance 84.6% on both, MXFP4 0.8605 / 0.8552.
