@@ -71,7 +71,8 @@ Key entry points:
   kernels in `atom/models/<model>/mono/` (MiniMax-M3; DeepSeek-V4.1, wrapped
   after load through `model_runner.mono_decode_installers`; its per-step cell
   decisions live in `deepseek_v41/mono/{index,attention,moe}_plan.py`, each
-  called by both the kernel and its CPU I3 test)
+  called by both the kernel and its CPU I3 test; Qwen3.5-MoE, wrapped the same
+  way, one launch a decoder layer and the MTP draft's layer on it)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
   and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
