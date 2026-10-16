@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
-
 from atom.models.qwen3_5.mono.config import Q35Config
 
 
@@ -18,22 +16,12 @@ class LayerWeights:
     full: bool  # gated full attention; else Gated DeltaNet
 
 
-def rope_cos_sin(positions: torch.Tensor, cfg: Q35Config):
-    """cos/sin [S, rope_dim] (halves repeated, rotate-half convention)."""
-    inv = 1.0 / (
-        cfg.rope_theta
-        ** (
-            torch.arange(0, cfg.rope_dim, 2, device=positions.device).float()
-            / cfg.rope_dim
-        )
-    )
-    f = positions.float()[:, None] * inv[None]
-    f = torch.cat([f, f], -1)
-    return f.cos(), f.sin()
-
-
-def rope_tables(cfg: Q35Config, max_pos: int, device="cuda"):
-    """The kernel's RoPE tables: cos, sin f32 [max_pos, rope_dim / 2] (the rotate-half halves are equal)."""
-    cos, sin = rope_cos_sin(torch.arange(max_pos, device=device), cfg)
-    half = cfg.rope_dim // 2
-    return cos[:, :half].contiguous(), sin[:, :half].contiguous()
+def rope_tables(rotary_emb, cfg: Q35Config, max_pos: int):
+    """The kernel's RoPE tables: ATOM's own (aiter's ``RotaryEmbedding`` caches, model dtype) as f32
+    cos, sin [max_pos, rope_dim / 2], or None when they do not cover ``max_pos`` positions.
+    """
+    cos = rotary_emb.cos_cache.reshape(rotary_emb.cos_cache.shape[0], -1)
+    sin = rotary_emb.sin_cache.reshape(rotary_emb.sin_cache.shape[0], -1)
+    if cos.shape[0] < max_pos or cos.shape[1] != cfg.rope_dim // 2:
+        return None
+    return cos[:max_pos].float().contiguous(), sin[:max_pos].float().contiguous()

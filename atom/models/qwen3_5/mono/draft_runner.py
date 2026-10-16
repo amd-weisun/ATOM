@@ -26,6 +26,7 @@ from atom.models.qwen3_5.mono.weights import LayerWeights, rope_tables
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -66,11 +67,21 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             raise MonoUnsupported(
                 f"{cus} CUs: the kernel needs all {BLOCKS} CTAs co-resident"
             )
-        self.cfg = Q35Config(tp=self.tp, rank=self.rank)
+        self.cfg = Q35Config(
+            tp=self.tp,
+            rank=self.rank,
+            qk_fusion=envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION,
+        )
         self.full = [True]
         self.layers = [(LayerWeights(self.cfg, True), self._pack(0, layer))]
         self.layer_nums = [layer.self_attn.attn.layer_num]
-        self.cos, self.sin = rope_tables(self.cfg, self.max_seq, device=self.dev)
+        # positions < max_model_len
+        rope = rope_tables(layer.self_attn.rotary_emb, self.cfg, self.max_seq - 1)
+        if rope is None:
+            raise MonoUnsupported(
+                f"the RoPE caches do not cover {self.max_seq - 1} positions"
+            )
+        self.cos, self.sin = rope
         logger.info("Qwen3.5 mono draft: rank %d bound the MTP layer", self.rank)
 
     def _build_draft_width(self, S: int, T: int) -> dict:
@@ -99,7 +110,7 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         return t is not None and self.by_t[t].prepare(rows)
 
     def layer(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """The decoder layer on ``x`` [rows, hidden] (the ``fc`` output, gathered): the residual
+        """The decoder layer on ``x`` [rows, hidden] (the ``fc`` output, gathered): the f32 residual
         stream after it (the draft's final norm is the caller's)."""
         md = get_forward_context().attn_metadata
         S = x.shape[0]
@@ -113,7 +124,11 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         built = self.by_t[T][S]
         kv = (lc.k_cache, lc.v_cache, lc.k_scale, lc.v_scale, pos, bt, slots)
         out = built["ops"][0].forward(
-            x.contiguous(), kv=kv, rope=(self.cos, self.sin), layer=0, advance=False
+            x.float().contiguous(),
+            kv=kv,
+            rope=(self.cos, self.sin),
+            layer=0,
+            advance=False,
         )
         built["variants"][True].advance_step()
         return out

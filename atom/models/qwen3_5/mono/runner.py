@@ -26,6 +26,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config, is_full_attention
+from atom.models.qwen3_5.mono.dispatch import final_norm
 from atom.models.qwen3_5.mono.layout import router_rows
 from atom.models.qwen3_5.mono.op import Qwen35MonoKernel, Qwen35Variant
 from atom.models.qwen3_5.mono.packing import pack_bf16
@@ -34,6 +35,7 @@ from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -127,7 +129,12 @@ class Qwen35MonoDecodeRunner:
         weights = (
             "mxfp4" if w13.dtype == getattr(torch, "float4_e2m1fn_x2", None) else "fp8"
         )
-        self.cfg = Q35Config(tp=self.tp, rank=self.rank, weights=weights)
+        self.cfg = Q35Config(
+            tp=self.tp,
+            rank=self.rank,
+            weights=weights,
+            qk_fusion=envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION,
+        )
         n = len(self.lm.layers)
         self.full = [is_full_attention(i) for i in range(n)]
         for i, layer in enumerate(self.lm.layers):
@@ -145,7 +152,18 @@ class Qwen35MonoDecodeRunner:
             (layer.self_attn.attn if self.full[i] else layer.linear_attn.attn).layer_num
             for i, layer in enumerate(self.lm.layers)
         ]
-        self.cos, self.sin = rope_tables(self.cfg, self.max_seq, device=self.dev)
+        rope = rope_tables(
+            next(
+                l for i, l in enumerate(self.lm.layers) if self.full[i]
+            ).self_attn.rotary_emb,
+            self.cfg,
+            self.max_seq - 1,  # positions < max_model_len
+        )
+        if rope is None:
+            raise MonoUnsupported(
+                f"the RoPE caches do not cover {self.max_seq - 1} positions"
+            )
+        self.cos, self.sin = rope
         logger.info("Qwen3.5 mono: rank %d bound %d layers", self.rank, n)
 
     def _pack(self, i, layer) -> dict:
@@ -334,6 +352,13 @@ class Qwen35MonoDecodeRunner:
     # ---------------------------------------------------------------- forward
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """The final normed hidden states [rows, hidden], as the model returns."""
+        pos, slots, bt, gdn = self.step_inputs(input_ids, positions)
+        x = self._layers(self.lm.embed_tokens(input_ids).float(), pos, slots, bt, gdn)
+        # the layers' f32 stream is what the original path's final (fused all-reduce) norm normalizes
+        return final_norm(self.lm.norm, x)
+
+    def step_inputs(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        """The step's (positions, cache slots, block tables, GDN state indices) as the kernel takes them."""
         fwd = get_forward_context()
         md = fwd.attn_metadata
         S = input_ids.numel()
@@ -368,10 +393,7 @@ class Qwen35MonoDecodeRunner:
             else:
                 gdn = (n_acc, spec.reshape(-1).to(torch.int32))
             bt = md.block_tables[:Q].repeat_interleave(T, 0)
-        x = self._layers(self.lm.embed_tokens(input_ids), pos, slots, bt, gdn)
-        # the kernel's residual is already reduced: the plain Gemma norm, not the fused
-        # all-reduce one the original path ends with
-        return self.lm.norm.forward_cuda(x)
+        return pos, slots, bt, gdn
 
     def _layers(self, x, pos, slots, bt, gdn):
         """The step's rows through every layer: one launch each."""

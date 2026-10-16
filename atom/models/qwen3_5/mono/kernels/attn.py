@@ -17,36 +17,39 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.qwen3_5.mono.config import FP8_MAX
-from atom.models.qwen3_5.mono.kernels.common import sigmoid
+from atom.models.qwen3_5.mono.kernels.common import fp8_word, sigmoid_precise
 from atom.models.qwen3_5.mono.kernels.helpers import traced
 from atom.models.qwen3_5.mono.kernels.ops import (
-    NEG,
+    bf2_f32,
     bf16_round,
     exp,
-    fp8_to_bf16x8,
     ld_f32,
     lds_ld,
     lds_st,
     rcp,
+    read_lane_i32,
     rsq,
     rsrc,
     uniform,
     wave_max,
     wave_sum,
+    xshfl,
 )
-from atom.models.qwen3_5.mono.layout import BS, KT, PROJ_TILE, WAVES
+from atom.models.qwen3_5.mono.layout import BS, PROJ_TILE, WAVES
 
 
 @traced
 def attn_stages(ctx):
     """1-4. q | gate, k, v projection; norm + RoPE + cache write; split attention; merge + gate."""
     EPS = ctx["EPS"]
+    QKF = ctx["QKF"]
+    QKF_O = ctx["QKF_O"]
     G = ctx["G"]
     H = ctx["H"]
     HD = ctx["HD"]
-    KROWE = ctx["KROWE"]
     KVD = ctx["KVD"]
     NSPLIT = ctx["NSPLIT"]
+    CPS = ctx["CPS"]
     OUT_K = ctx["OUT_K"]
     QG = ctx["QG"]
     ROPE = ctx["ROPE"]
@@ -61,7 +64,6 @@ def attn_stages(ctx):
     g_qn1 = ctx["g_qn1"]
     k_cache = ctx["k_cache"]
     k_scale = ctx["k_scale"]
-    kvt = ctx["kvt"]
     lane = ctx["lane"]
     mb = ctx["mb"]
     misc = ctx["misc"]
@@ -129,10 +131,17 @@ def attn_stages(ctx):
         return t
 
     def kv_quant(x, live):
-        """Per-token FP8 E4M3 over the head (``amax / 448``) -> (FP8 value as f32, scale)."""
+        """Per-token FP8 E4M3 over the head as the original path writes it -> (FP8 value as f32, scale,
+        the FP8 word). aiter's ``reshape_and_cache``: the scale ``amax / 448`` (stored as is: 0 for an
+        all-zero head), x times ``1 / max(scale, 1e-12)``; ATOM's fused q / k norm + RoPE + cache kernel
+        (QKF): ``amax / 448`` (1 for an all-zero head), x divided by it."""
         amax = block_max(live.select(fmath.absf(x), fx.Float32(0.0)))
-        sc = (amax > 0.0).select(amax / FP8_MAX, fx.Float32(1.0))
-        q = fx.min(fx.max(x / sc, -FP8_MAX), FP8_MAX)
+        sc = amax / FP8_MAX
+        if const_expr(QKF):
+            sc = (sc == 0.0).select(fx.Float32(1.0), sc)
+            q = x / sc
+        else:
+            q = x * (1.0 / fx.max(sc, fx.Float32(1.0e-12)))
         word = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q, q, fx.Int32(0), False))
         v2 = fx.Vector.make_type(2, fx.Float32)
         q8 = fx.Vector(rocdl.cvt_pk_f32_fp8(res=v2, src=word, word_sel=False))[0]
@@ -154,18 +163,23 @@ def attn_stages(ctx):
         x = got[0][0].bitcast(fx.Float32)
         vraw = got[1][0].bitcast(fx.Float32)
         rstd = rsq(block_sum(live.select(x * x, fx.Float32(0.0))) * (1.0 / HD) + EPS)
-        xn = bf16_round(x * rstd * gam)
+        # the Gemma norm, then RoPE: rounded to bf16 between (the original's two kernels), or once after
+        # (QKF: its fused kernel, which also quantizes K for the cache from the unrounded value)
+        xn = x * rstd * gam
+        if const_expr(not QKF):
+            xn = bf16_round(xn)
         lds_st(outs, d, xn)
         gpu.barrier()
         partner = lds_ld(outs, (d < HALF).select(d + HALF, d - HALF))
         cs = ld_f32(r_cos, pos * HALF + d % HALF)
         sn = ld_f32(r_sin, pos * HALF + d % HALF)
         rot = (d < HALF).select(xn * cs - partner * sn, xn * cs + partner * sn)
-        y = bf16_round((d < ROPE).select(rot, xn))
+        y_f = (d < ROPE).select(rot, xn)
+        y = bf16_round(y_f)
         if live & (j < H):
             put(mb("q"), (s * H + j) * HD + d, y)
         if is_kv:
-            k8, ksc, kword = kv_quant(y, live)
+            k8, ksc, kword = kv_quant(y_f if QKF else y, live)
             v8, vsc, vword = kv_quant(vraw, live)
             # the token's cache slot (block * BS + offset) is the engine's; -1 = a padding row: no write
             slot = uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32))
@@ -191,28 +205,53 @@ def attn_stages(ctx):
                 put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD, ksc)
                 put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD + 1, vsc)
 
-    # ================================ 3. split attention on the matrix cores
-    # A tile is KT = 64 keys = 4 cache blocks. S^T = K q^T: 16x16x32 MFMAs with keys as M (a row group is
-    # one block) and the query heads as N, the head dim split over two wave halves; then P V with the heads
-    # as M and 16-dim groups as N. K / V fragments come straight from the cache (FP8 codes are exact in
-    # bf16); a key's scales fold into its score and its softmax weight. This launch's token is masked
-    # from the tiles (other CTAs may not see its cache store yet) and added once, after them.
-    QROWE = KROWE  # q rows (bf16) in kvt, padded off the bank
-    XP = 0  # P [16 rows][KT] f32 (rows >= H stay 0)
-    XC = XP + 16 * KT  # per-head rescale [16] | this token's weight [16]
-    XN = XC + 32  # this token's K then V codes (f32) | its two scales
-    WRG = wave % 4  # QK: this wave's key row group
-    WKH = wave // 4  # QK: this wave's half of the head dim
+    # ================================ 3. split attention (aiter's pa_decode_gluon, FP8 compute)
+    # Baseline ATOM's decode attention, rounding point for rounding point (spec: aiter's
+    # paged_attention_decode_sliding_window_head_1 + the pa_ps reduce): NSPLIT splits a sequence's
+    # tokens evenly (page = ceil(ctx / NSPLIT)); a split walks the 256-key partitions it touches in order,
+    # keeping only its own keys. Per partition: Q (FP8, unscaled) x K on FP8 MFMAs (head dim in order),
+    # the score (scale * k_scale) * dot, an online softmax in exp2, P' = FP8(v_scale * (448 / vmax) * p)
+    # with vmax the partition's largest V scale, and P' x V on FP8 MFMAs (keys in order) times vmax / 448.
+    # A split publishes its bf16 output and its (max, exp sum). Task = (row, split): the row's 8 heads are
+    # the MFMA's rows. This launch's keys (positions pos0 ..) come from ``kvnew``: other CTAs may not see
+    # their cache stores yet.
+    MASKV = -3.4e38
+    # rows padded off the 64-word stride: the 16 lanes of an MFMA operand / score row group would hit one
+    # LDS bank (an even pad keeps the 8-byte operand loads aligned)
+    SXS, SPP, SQ8 = CPS + 1, CPS // 4 + 2, HD // 4 + 2
+    XS = 0  # scores [16 heads][CPS] f32
+    XPP = XS + 16 * SXS  # P' FP8 [16 heads][CPS / 4 words]
+    XQ8 = XPP + 16 * SPP  # Q FP8 [16 heads][HD / 4 words]
+    XA = XQ8 + 16 * SQ8  # per head: softmax rescale a | max | exp sum
+    XKN = (
+        XA + 64
+    )  # this launch's keys: K FP8 [T_SEQ][HD / 4 words] | V FP8 | their k, v scales
+    XVN = XKN + T_SEQ * HD // 4
+    XSN = XVN + T_SEQ * HD // 4
     NG = HD // 16 // WAVES  # PV: 16-dim groups per wave
-    assert NG == 2, "the P V accumulators are carried as two 16-dim groups per wave"
-    KSTEPS = HD // 32 // 2  # QK k-steps per wave
+    assert NG == 2 and CPS // 16 == 2 * WAVES and H == WAVES
     g4 = lane // 16
-    v8b = fx.Vector.make_type(8, fx.BFloat16)
-    v4f = fx.Vector.make_type(4, fx.Float32)
-    v4z = fx.Vector.filled(4, 0.0, fx.Float32)
 
-    def mfma(a, b, c):
-        return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+    def i64_of(w0, w1):
+        return (fx.Int64(fx.Uint32(w1)) << 32) | fx.Int64(fx.Uint32(w0))
+
+    def lds_i64(idx):
+        w = fx.Vector(
+            fx.ptr_load(xs + idx, result_type=fx.Vector.make_type(2, fx.Float32))
+        )
+        return i64_of(w[0].bitcast(fx.Int32), w[1].bitcast(fx.Int32))
+
+    def fp8_byte(word_f32, byte):
+        """Byte ``byte`` (runtime) of an LDS word as an E4M3FN value."""
+        w = word_f32.bitcast(fx.Int32) >> (8 * byte)
+        return fx.Vector(
+            rocdl.cvt_pk_f32_fp8(
+                res=fx.Vector.make_type(2, fx.Float32), src=w, word_sel=False
+            )
+        )[0]
+
+    def mfma8(a, b, c):
+        return fx.Vector(rocdl.mfma_f32_16x16x32_fp8_fp8(T.f32x4, [a, b, c, 0, 0, 0]))
 
     for tt in range(start("split"), S * NSPLIT, G):
         tt = fx.Int32(tt)
@@ -220,355 +259,320 @@ def attn_stages(ctx):
         js = tt % NSPLIT
         gpu.barrier()
         pos = ld_pos(s)
-        ctx_len = pos + 1
-        # keys from pos0 on are this launch's (the sequence's earlier MTP tokens and this one): from kvnew
+        # the sequence: rows s0 .. s0 + T_SEQ - 1, keys pos0 .. pos0 + T_SEQ - 1 this launch's
+        s0 = s - s % T_SEQ
         pos0 = pos - s % T_SEQ
-        span = (
-            (ctx_len + NSPLIT * KT - 1) // (NSPLIT * KT) * KT
-        )  # keys per split, whole tiles
-        k0 = js * span
-        k1 = fx.min(k0 + span, ctx_len)
-        ntile = fx.max(k1 - k0 + KT - 1, 0) // KT
+        ctx_len = pos0 + T_SEQ
+        page = (ctx_len + NSPLIT - 1) // NSPLIT
+        k0 = page * js
+        k1 = fx.min(ctx_len, k0 + page)
+        p0 = k0 // CPS
+        npart = (k0 < ctx_len).select((k1 + CPS - 1) // CPS - p0, fx.Int32(0))
         last_blk = (ctx_len - 1) // BS
-        # q -> kvt as bf16 [16 rows][QROWE]; rows >= H and P rows >= H are zero
-        qv = poll(
-            [(mb("q"), s * H * HD + tid + i * 512, 1) for i in range((H * HD) // 512)]
-        )
-        for i in range_constexpr((H * HD) // 512):
-            idx = tid + i * 512
-            fx.ptr_store(
-                qv[i][0].bitcast(fx.Float32).to(fx.BFloat16),
-                kvt + ((idx // HD) * QROWE + idx % HD),
-            )
-        for i in range_constexpr(((16 - H) * HD + 511) // 512):
-            idx = fx.min(tid + i * 512, (16 - H) * HD - 1)
-            fx.ptr_store(
-                fx.Float32(0.0).to(fx.BFloat16),
-                kvt + ((H + idx // HD) * QROWE + idx % HD),
-            )
-        for i in range_constexpr(((16 - H) * KT + 511) // 512):
-            lds_st(
-                xs,
-                XP + H * KT + fx.min(tid + i * 512, (16 - H) * KT - 1),
-                fx.Float32(0.0),
-            )
-        gpu.barrier()
-        # this wave's q B-fragments (head lane % 16, dims 32 ks + 8 g4 ..), fixed over the tiles
-        qb = [
-            fx.Vector(
-                fx.ptr_load(
-                    kvt + ((lane % 16) * QROWE + (WKH * KSTEPS + c) * 32 + 8 * g4),
-                    result_type=v8b,
-                )
-            )
-            for c in range(KSTEPS)
-        ]
-        m = fx.Float32(NEG)
-        lsum = fx.Float32(0.0)
-        # P V accumulators, carried as named scalars (the loop rewriter carries names, not list items):
-        # group n, row e is a{4 n + e}
-        a0 = fx.Float32(0.0)
-        a1 = fx.Float32(0.0)
-        a2 = fx.Float32(0.0)
-        a3 = fx.Float32(0.0)
-        a4 = fx.Float32(0.0)
-        a5 = fx.Float32(0.0)
-        a6 = fx.Float32(0.0)
-        a7 = fx.Float32(0.0)
 
-        def tile_loads(kb_):
-            """A tile's K fragments (this wave's row group and head-dim half), V fragments (dims 16 n + lane
-            % 16, keys 32 ks + 8 g4 ..) and the lane's key scales: issued a tile ahead (blocks past the
-            context clamp to the last one; those keys are masked)."""
-            b0 = kb_ // BS
-            kblk = uniform(
-                bo.buffer_load(
-                    r_bt,
-                    s * bt_stride + fx.min(b0 + WRG, last_blk),
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-            )
-            kw = []
-            for c in range_constexpr(KSTEPS):
-                ks = WKH * KSTEPS + c
-                off = (
-                    kblk * (HD * BS)
-                    + ((2 * ks + g4 // 2) * BS + lane % 16) * 16
-                    + 8 * (g4 % 2)
-                )
-                w2 = fx.Vector(bo.buffer_load(r_kc, off // 4, vec_width=2, dtype=T.i32))
-                kw += [w2[0], w2[1]]
-            vw = []
-            for n in range_constexpr(NG):
-                for ks in range_constexpr(2):
-                    vblk = ld_block(s, fx.min(b0 + 2 * ks + g4 // 2, last_blk))
-                    dim = (wave * NG + n) * 16 + lane % 16
-                    w2 = fx.Vector(
-                        bo.buffer_load(
-                            r_vc,
-                            (vblk * (HD * BS) + dim * 16 + 8 * (g4 % 2)) // 4,
-                            vec_width=2,
-                            dtype=T.i32,
+        def raw_loads(tb):
+            """Partition ``tb``'s global loads, none waiting on this launch: per QK block (2) its 8 K words
+            and 4 k scales, the softmax's 4 v scales, P' V's 16 V words. A block past the context reads the
+            last one (masked at use)."""
+            out = []
+            for gi in range_constexpr(2):
+                bi = tb // BS + wave * 2 + gi
+                blk = ld_block(s0, fx.min(bi, last_blk))
+                for c in range_constexpr(HD // 32):
+                    d = 32 * c + 8 * g4
+                    off = ((blk * (HD // 16) + d // 16) * BS + lane % 16) * 16 + d % 16
+                    out.append(
+                        fx.Vector(
+                            bo.buffer_load(r_kc, off // 4, vec_width=2, dtype=T.i32)
                         )
                     )
-                    vw += [w2[0], w2[1]]
-            sblk = ld_block(s, fx.min(b0 + lane // 16, last_blk))
-            return (
-                kw
-                + vw
-                + [
-                    ld_f32(r_ks, sblk * BS + lane % 16),
-                    ld_f32(r_vs, sblk * BS + lane % 16),
-                ]
-            )
-
-        # the next tile's fragments, carried as named scalars (the loop rewriter carries names, not lists)
-        (
-            f0,
-            f1,
-            f2,
-            f3,
-            f4,
-            f5,
-            f6,
-            f7,
-            f8,
-            f9,
-            f10,
-            f11,
-            f12,
-            f13,
-            f14,
-            f15,
-            f16,
-            f17,
-        ) = tile_loads(k0)
-        for it in range(ntile):
-            kb = k0 + it * KT
-            cur = [f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15]
-            ksc, vsc = f16, f17
-            # S^T partial: keys of row group WRG (= block kb / BS + WRG) x heads, half WKH of the head dim
-            c4 = v4z
-            for c in range_constexpr(KSTEPS):
-                c4 = mfma(fp8_to_bf16x8(cur[2 * c], cur[2 * c + 1]), qb[c], c4)
-            fx.ptr_store(c4, red + (wave * 64 + lane) * 4)
-            (
-                f0,
-                f1,
-                f2,
-                f3,
-                f4,
-                f5,
-                f6,
-                f7,
-                f8,
-                f9,
-                f10,
-                f11,
-                f12,
-                f13,
-                f14,
-                f15,
-                f16,
-                f17,
-            ) = tile_loads(kb + KT)
-            # this lane's V fragments (masked keys' bytes 0)
-            vfr = []
-            for n in range_constexpr(NG):
-                for ks in range_constexpr(2):
-                    kfirst = kb + 32 * ks + 8 * g4
-                    words = []
-                    for half in range_constexpr(2):
-                        mask = fx.Int32(0)
-                        for j in range_constexpr(4):
-                            key = kfirst + half * 4 + j
-                            ok = (key < k1) & (key < pos0)
-                            mask = mask | ok.select(
-                                fx.Int32(0xFF << (8 * j) if j < 3 else -(1 << 24)),
-                                fx.Int32(0),
-                            )
-                        words.append(cur[2 * KSTEPS + (n * 2 + ks) * 2 + half] & mask)
-                    vfr.append(fp8_to_bf16x8(words[0], words[1]))
-            gpu.barrier()
-            # softmax over the tile: wave = head, lane = key
-            kk = lane % 16
-            src = (wave + 16 * (kk // 4)) * 4 + kk % 4
-            dot = lds_ld(red, (lane // 16) * 256 + src) + lds_ld(
-                red, (lane // 16 + 4) * 256 + src
-            )
-            key_abs = kb + lane
-            ok = (key_abs < k1) & (key_abs < pos0)
-            sc_ = ok.select(dot * ksc * SCALE, fx.Float32(NEG))
-            m_new = fx.max(m, wave_max(sc_))
-            p = exp(sc_ - m_new)
-            corr = exp(m - m_new)
-            lsum = lsum * corr + wave_sum(p)
-            m = m_new
-            lds_st(xs, XP + wave * KT + lane, ok.select(p * vsc, fx.Float32(0.0)))
-            if lane == 0:
-                lds_st(xs, XC + wave, corr)
-            gpu.barrier()
-            # P V: heads (rows 4 g4 + e) x this wave's dim groups
-            cr = [lds_ld(xs, XC + fx.min(4 * g4 + e, H - 1)) for e in range(4)]
-            crv = fx.Vector.from_elements(cr, fx.Float32)
-            acc = [fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32) * crv]
-            acc.append(fx.Vector.from_elements([a4, a5, a6, a7], fx.Float32) * crv)
-            for ks in range_constexpr(2):
-                pa = fx.Vector(
-                    fx.ptr_load(
-                        xs + (XP + (lane % 16) * KT + 32 * ks + 8 * g4), result_type=v4f
-                    )
-                )
-                pb = fx.Vector(
-                    fx.ptr_load(
-                        xs + (XP + (lane % 16) * KT + 32 * ks + 8 * g4 + 4),
-                        result_type=v4f,
-                    )
-                )
-                pf = fx.Vector.from_elements(
-                    [pa[e] for e in range(4)] + [pb[e] for e in range(4)], fx.Float32
-                )
-                pbf = pf.to(fx.BFloat16)
-                for n in range_constexpr(NG):
-                    acc[n] = mfma(pbf, vfr[n * 2 + ks], acc[n])
-            a0, a1, a2, a3 = acc[0][0], acc[0][1], acc[0][2], acc[0][3]
-            a4, a5, a6, a7 = acc[1][0], acc[1][1], acc[1][2], acc[1][3]
-            gpu.barrier()
-        # this launch's tokens of the sequence (positions pos0 .. pos): one more key each, in the split
-        # that holds it
-        for tk in range_constexpr(T_SEQ):
-            kpos = pos0 + tk
-            krow = s - s % T_SEQ + tk
-            if const_expr(tk > 0):
-                gpu.barrier()  # the previous key's LDS row is read
-            if (kpos <= pos) & (kpos >= k0) & (kpos < k1):
-                if tid < 2 * HD:
-                    nv = poll([(mb("kvnew"), krow * (2 * HD + 2) + tid, 1)])[0][
-                        0
-                    ].bitcast(fx.Float32)
-                    lds_st(xs, XN + tid, nv)
-                # its two scales (2 * HD may be every thread, so not a thread past the codes)
-                if tid < 2:
-                    sc2 = poll([(mb("kvnew"), krow * (2 * HD + 2) + 2 * HD + tid, 1)])[
-                        0
-                    ][0].bitcast(fx.Float32)
-                    lds_st(xs, XN + 2 * HD + tid, sc2)
-                gpu.barrier()
-                part = fx.Float32(0.0)
-                for e in range_constexpr(HD // 64):
-                    d = lane * (HD // 64) + e
-                    qd = fx.Float32(fx.ptr_load(kvt + (wave * QROWE + d)))
-                    part = part + qd * lds_ld(xs, XN + d)
-                s_new = wave_sum(part) * lds_ld(xs, XN + 2 * HD) * SCALE
-                m_new = fx.max(m, s_new)
-                corr = exp(m - m_new)
-                p_new = exp(s_new - m_new)
-                lsum = lsum * corr + p_new
-                m = m_new
-                if lane == 0:
-                    lds_st(xs, XC + wave, corr)
-                    lds_st(xs, XC + 16 + wave, p_new * lds_ld(xs, XN + 2 * HD + 1))
-                gpu.barrier()
-                cr = fx.Vector.from_elements(
-                    [lds_ld(xs, XC + fx.min(4 * g4 + e, H - 1)) for e in range(4)],
-                    fx.Float32,
-                )
-                pn = fx.Vector.from_elements(
-                    [lds_ld(xs, XC + 16 + fx.min(4 * g4 + e, H - 1)) for e in range(4)],
-                    fx.Float32,
-                )
-                vd0 = fx.Vector.filled(
-                    4, lds_ld(xs, XN + HD + (wave * NG) * 16 + lane % 16), fx.Float32
-                )
-                vd1 = fx.Vector.filled(
-                    4,
-                    lds_ld(xs, XN + HD + (wave * NG + 1) * 16 + lane % 16),
-                    fx.Float32,
-                )
-                n0 = (
-                    fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32) * cr
-                    + pn * vd0
-                )
-                n1 = (
-                    fx.Vector.from_elements([a4, a5, a6, a7], fx.Float32) * cr
-                    + pn * vd1
-                )
-                a0, a1, a2, a3 = n0[0], n0[1], n0[2], n0[3]
-                a4, a5, a6, a7 = n1[0], n1[1], n1[2], n1[3]
-        # publish: rows 4 g4 + e < H are the query heads
-        if lane < 4 * H:
-            accs = [a0, a1, a2, a3, a4, a5, a6, a7]
+                for e in range_constexpr(4):
+                    out.append(ld_f32(r_ks, blk * BS + 4 * g4 + e))
+            for j in range_constexpr(4):
+                t = tb + 4 * lane + j
+                blk = ld_block(s0, fx.min(t // BS, last_blk))
+                out.append(ld_f32(r_vs, blk * BS + t % BS))
             for n in range_constexpr(NG):
                 dim = (wave * NG + n) * 16 + lane % 16
-                for e in range_constexpr(4):
-                    head = 4 * g4 + e
-                    put(
-                        mb("sp_acc"),
-                        ((s * NSPLIT + js) * H + head) * HD + dim,
-                        accs[4 * n + e],
+                for c in range_constexpr(CPS // 32):
+                    tk = 32 * c + 8 * g4  # this lane's 8 keys (one cache block's half)
+                    blk = ld_block(s0, fx.min((tb + tk) // BS, last_blk))
+                    off = blk * (HD * BS) + dim * 16 + tk % 16
+                    out.append(
+                        fx.Vector(
+                            bo.buffer_load(r_vc, off // 4, vec_width=2, dtype=T.i32)
+                        )
                     )
-        if lane == 0:
-            put2(mb("sp_ml"), ((s * NSPLIT + js) * H + wave) * 2, m, lsum)
+            return out
 
-    # ================================ 4. merge the splits, output gate -> gated
-    MT = 64  # dims per merge task
-    GRP = 512 // MT  # split groups per task, one thread per (group, dim)
-    for tt in range(start("merge"), S * H * (HD // MT), G):
-        tt = fx.Int32(tt)
-        s = tt // (H * (HD // MT))
-        h = (tt // (HD // MT)) % H
-        dt = tt % (HD // MT)
-        gpu.barrier()
-        jt = fx.min(tid, NSPLIT - 1)
-        ml = poll([(mb("sp_ml"), ((s * NSPLIT + jt) * H + h) * 2, 2)])[0]
-        mj = (tid < NSPLIT).select(ml[0].bitcast(fx.Float32), fx.Float32(NEG))
-        mx = block_max(mj)
-        wj = exp(mj - mx)
-        lsum = block_sum(
-            (tid < NSPLIT).select(wj * ml[1].bitcast(fx.Float32), fx.Float32(0.0))
+        # the first partition's loads before this launch's inputs: their latency hides under the wait
+        raw0 = raw_loads(p0 * CPS)
+        # Q -> FP8 bytes (unscaled), heads >= H zero; P' rows >= H zero
+        qv = poll([(mb("q"), s * H * HD + 4 * tid + 2 * i, 2) for i in range(2)])
+        lds_st(
+            xs,
+            XQ8 + (tid // (HD // 4)) * SQ8 + tid % (HD // 4),
+            fp8_word(
+                *[qv[i][e].bitcast(fx.Float32) for i in range(2) for e in range(2)]
+            ).bitcast(fx.Float32),
         )
-        if tid < NSPLIT:
-            lds_st(misc, tid, wj)
+        lds_st(
+            xs, XQ8 + (H + tid // (HD // 4)) * SQ8 + tid % (HD // 4), fx.Float32(0.0)
+        )
+        if tid < (16 - H) * CPS // 4:
+            lds_st(
+                xs,
+                XPP + (H + tid // (CPS // 4)) * SPP + tid % (CPS // 4),
+                fx.Float32(0.0),
+            )
+        # this launch's keys, for every split with a tile (their V scales enter the tile's vmax, their
+        # P' = 0 products the split's sums): K / V codes (exact FP8 values) back to bytes
+        if (npart > 0) & (tid < T_SEQ * 2 * HD // 4):
+            i_ = tid // (2 * HD // 4)
+            kv_ = (tid // (HD // 4)) % 2
+            d4 = (tid % (HD // 4)) * 4
+            base = (s0 + i_) * (2 * HD + 2) + kv_ * HD + d4
+            got = poll([(mb("kvnew"), base, 2), (mb("kvnew"), base + 2, 2)])
+            w = fp8_word(
+                *[got[i][e].bitcast(fx.Float32) for i in range(2) for e in range(2)]
+            )
+            lds_st(
+                xs,
+                XKN + kv_ * (T_SEQ * HD // 4) + i_ * (HD // 4) + d4 // 4,
+                w.bitcast(fx.Float32),
+            )
+        if (npart > 0) & (tid < 2 * T_SEQ):
+            sc2 = poll(
+                [(mb("kvnew"), (s0 + tid // 2) * (2 * HD + 2) + 2 * HD + tid % 2, 1)]
+            )
+            lds_st(xs, XSN + tid, sc2[0][0].bitcast(fx.Float32))
         gpu.barrier()
-        dim = tid % MT
-        grp = tid // MT
-        NQ = -(-NSPLIT // GRP)
-        accs = poll(
-            [
-                (
-                    mb("sp_acc"),
-                    ((s * NSPLIT + fx.min(grp + q * GRP, NSPLIT - 1)) * H + h) * HD
-                    + dt * MT
-                    + dim,
-                    1,
+
+        def key_patch(t, cached, odd):
+            """Key ``t``'s cached scale, or this launch's from LDS (k scale: odd 0, v: odd 1)."""
+            new = (t >= pos0) & (t < ctx_len)
+            i_ = fx.min(fx.max(t - pos0, 0), T_SEQ - 1)
+            return new.select(lds_ld(xs, XSN + 2 * i_ + odd), cached)
+
+        # raw_loads' layout: per QK block gi, 8 K words then 4 k scales; 4 v scales; 16 V words
+        RAW_K, RAW_VS, RAW_V = 0, 24, 28
+        RAW_VEC = [isinstance(x, fx.Vector) for x in raw0]
+        # the online softmax's (max, exp sum), the P V accumulators (heads 4 g4 + e, this wave's two 16-dim
+        # groups) and the partition's loads, carried; each partition issues the next one's loads
+        init = [fx.Float32(float("-inf")), fx.Float32(0.0)]
+        init += [fx.Float32(0.0) for _ in range(8)] + raw0
+        for pi, carry in range(0, npart, fx.Int32(1), init=init):
+            tb = (p0 + fx.Int32(pi)) * CPS
+            m = fx.Float32(carry[0])
+            lsum = fx.Float32(carry[1])
+            av = [fx.Float32(carry[2 + i]) for i in range(8)]
+            raw = [
+                fx.Vector(carry[10 + i]) if RAW_VEC[i] else fx.Float32(carry[10 + i])
+                for i in range(len(RAW_VEC))
+            ]
+            # the softmax's V scales (lane: keys 4 lane ..)
+            vss = []
+            for j in range_constexpr(4):
+                t = tb + 4 * lane + j
+                vs_ = key_patch(t, raw[RAW_VS + j], 1)
+                vss.append((t < ctx_len).select(vs_, fx.Float32(0.0)))
+            # QK: keys of this wave's two cache blocks (rows) x heads (columns), head dim in order
+            for gi in range_constexpr(2):
+                bi = tb // BS + wave * 2 + gi
+                trow = bi * BS + lane % 16  # this lane's A-row key
+                newk = (trow >= pos0) & (trow < ctx_len)
+                inew = fx.min(fx.max(trow - pos0, 0), T_SEQ - 1)
+                c4 = fx.Vector.filled(4, 0.0, fx.Float32)
+                for c in range_constexpr(HD // 32):
+                    d = 32 * c + 8 * g4
+                    w2 = raw[RAW_K + gi * 12 + c]
+                    kn = lds_i64(XKN + inew * (HD // 4) + d // 4)
+                    ka = newk.select(kn, i64_of(w2[0], w2[1]))
+                    c4 = mfma8(ka, lds_i64(XQ8 + (lane % 16) * SQ8 + d // 4), c4)
+                for e in range_constexpr(4):
+                    t = bi * BS + 4 * g4 + e
+                    ks_ = key_patch(t, raw[RAW_K + gi * 12 + 8 + e], 0)
+                    ok = (t >= k0) & (t < k1) & (t <= pos)
+                    sc_ = (SCALE * ks_) * c4[e]
+                    lds_st(
+                        xs,
+                        XS + (lane % 16) * SXS + (t - tb),
+                        ok.select(sc_, fx.Float32(MASKV)),
+                    )
+            gpu.barrier()
+            # online softmax of head `wave` over the partition (lane: keys 4 lane ..)
+            scs = [lds_ld(xs, XS + wave * SXS + 4 * lane + j) for j in range(4)]
+            vmax = wave_max(fx.max(fx.max(vss[0], vss[1]), fx.max(vss[2], vss[3])))
+            m_new = fx.max(
+                m, wave_max(fx.max(fx.max(scs[0], scs[1]), fx.max(scs[2], scs[3])))
+            )
+            alpha = exp(m - m_new)
+            ps_ = [exp(scs[j] - m_new) for j in range(4)]
+            lsum = fmath.fma(
+                alpha, lsum, wave_sum(((ps_[0] + ps_[1]) + ps_[2]) + ps_[3])
+            )
+            m = m_new
+            f8i = 448.0 * rcp(vmax + 1.0e-8)
+            pq = [(vss[j] * f8i) * ps_[j] for j in range(4)]
+            lds_st(xs, XPP + wave * SPP + lane, fp8_word(*pq).bitcast(fx.Float32))
+            pscale = vmax * (1.0 / 448.0)
+            if lane == 0:
+                lds_st(xs, XA + wave, alpha)
+            gpu.barrier()
+            # P' V: heads (rows 4 g4 + e) x this wave's 16-dim groups, keys in order
+            al = fx.Vector.from_elements(
+                [lds_ld(xs, XA + 4 * g4 + e) for e in range(4)], fx.Float32
+            )
+            accs = [
+                fx.Vector.from_elements(av[0:4], fx.Float32),
+                fx.Vector.from_elements(av[4:8], fx.Float32),
+            ]
+            for n in range_constexpr(NG):
+                dim = (wave * NG + n) * 16 + lane % 16
+                pv = fx.Vector.filled(4, 0.0, fx.Float32)
+                for c in range_constexpr(CPS // 32):
+                    tk = 32 * c + 8 * g4  # this lane's 8 keys (one cache block's half)
+                    w2 = raw[RAW_V + n * (CPS // 32) + c]
+                    # this launch's keys (the suffix from pos0 on) are not in the cache yet for every
+                    # CTA: their bytes zeroed here, their products added below
+                    nk = fx.min(
+                        fx.max(pos0 - (tb + tk), 0), 8
+                    )  # this lane's cached keys
+                    m0 = (nk >= 4).select(fx.Int32(-1), (fx.Int32(1) << (8 * nk)) - 1)
+                    m1 = (nk >= 8).select(
+                        fx.Int32(-1),
+                        (nk <= 4).select(
+                            fx.Int32(0), (fx.Int32(1) << (8 * (nk - 4))) - 1
+                        ),
+                    )
+                    pv = mfma8(
+                        lds_i64(XPP + (lane % 16) * SPP + tk // 4),
+                        i64_of(w2[0] & m0, w2[1] & m1),
+                        pv,
+                    )
+                # this launch's keys in the partition: P' x V from LDS (exact FP8 products)
+                vdim = dim // 4
+                for i in range_constexpr(T_SEQ):
+                    t = pos0 + i
+                    inside = (t >= tb) & (t < tb + CPS)
+                    tl = fx.min(fx.max(t - tb, 0), CPS - 1)
+                    vn = fp8_byte(lds_ld(xs, XVN + i * (HD // 4) + vdim), dim % 4)
+                    for e in range_constexpr(4):
+                        pq = fp8_byte(
+                            lds_ld(xs, XPP + (4 * g4 + e) * SPP + tl // 4),
+                            tl % 4,
+                        )
+                        pv_e = pv[e] + inside.select(pq * vn, fx.Float32(0.0))
+                        pv = fx.Vector.from_elements(
+                            [pv_e if j == e else pv[j] for j in range(4)], fx.Float32
+                        )
+                accs[n] = fx.Vector.from_elements(
+                    [fmath.fma(accs[n][e], al[e], pscale * pv[e]) for e in range(4)],
+                    fx.Float32,
                 )
-                for q in range(NQ)
+            nxt = raw_loads(
+                tb + CPS
+            )  # the next partition's (a split's last: clamped, unused)
+            gpu.barrier()
+            res = (
+                yield [m, lsum] + [accs[n][e] for n in range(2) for e in range(4)] + nxt
+            )
+        m = fx.Float32(res[0])
+        lsum = fx.Float32(res[1])
+        a0, a1, a2, a3, a4, a5, a6, a7 = [fx.Float32(res[2 + i]) for i in range(8)]
+        # the split's output: acc * (1 / l) to bf16; (max, exp sum) per head
+        if lane == 0:
+            lds_st(xs, XA + 16 + wave, m)
+            lds_st(xs, XA + 32 + wave, lsum)
+        gpu.barrier()
+        accs_ = [a0, a1, a2, a3, a4, a5, a6, a7]
+        for e in range_constexpr(4):
+            head = 4 * g4 + e
+            le = lds_ld(xs, XA + 32 + fx.min(head, H - 1))
+            inv_l = 1.0 / (le > 0.0).select(le, fx.Float32(1.0))
+            for n in range_constexpr(NG):
+                if head < H:
+                    dim = (wave * NG + n) * 16 + lane % 16
+                    lds_st(outs, head * HD + dim, bf16_round(accs_[4 * n + e] * inv_l))
+        gpu.barrier()
+        for i in range_constexpr(H * HD // 2 // 512):
+            pr_ = tid + i * 512
+            put_bf(
+                mb("sp_out"),
+                ((s * NSPLIT + js) * H) * HD + 2 * pr_,
+                [lds_ld(outs, 2 * pr_), lds_ld(outs, 2 * pr_ + 1)],
+            )
+        if lane == 0:
+            put2(
+                mb("sp_ml"),
+                ((s * NSPLIT + js) * H + wave) * 2,
+                lds_ld(xs, XA + 16 + wave),
+                lds_ld(xs, XA + 32 + wave),
+            )
+
+    # ================================ 4. merge the splits (aiter's pa_ps reduce), output gate -> gated
+    NSP2 = 1 << (NSPLIT - 1).bit_length()
+    BUTTERFLY = tuple(NSP2 >> i for i in range(1, NSP2.bit_length()))  # NSP2 / 2 .. 1
+    for tt in range(start("merge"), S * H, G):
+        tt = fx.Int32(tt)
+        s = tt // H
+        h = tt % H
+        gpu.barrier()
+        # every wave reduces the (at most 64) splits alike, wave 0 stores the weights: no wave-divergent
+        # region around the lane shuffles
+        jt = fx.min(lane, NSPLIT - 1)
+        ml = poll([(mb("sp_ml"), ((s * NSPLIT + jt) * H + h) * 2, 2)])[0]
+        in_ = lane < NSPLIT
+        mj = in_.select(ml[0].bitcast(fx.Float32), fx.Float32(float("-inf")))
+        lj = in_.select(ml[1].bitcast(fx.Float32), fx.Float32(0.0))
+        gmax = wave_max(mj)
+        sgmax = (gmax > -3.4028234663852886e38).select(gmax, fx.Float32(0.0))
+        valid = mj > -3.4028234663852886e38
+        x = lj * valid.select(exp(mj - sgmax), fx.Float32(0.0))
+        # the exp sum by xor butterfly over the next power of two of lanes
+        tot = (lane < NSP2).select(x, fx.Float32(0.0))
+        for o_ in BUTTERFLY:
+            tot = tot + xshfl(tot, o_)
+        tot0 = read_lane_i32(tot.bitcast(fx.Int32), 0).bitcast(fx.Float32)
+        wj = x / (tot0 > 0.0).select(tot0, fx.Float32(1.0))
+        if (wave == 0) & (lane < NSPLIT):
+            lds_st(misc, lane, wj)
+        gpu.barrier()
+        # every thread polls (a dim pair, clamped); the first HD / 2 store: no divergent poll loop
+        tq = tid % (HD // 2)
+        parts = poll(
+            [
+                (mb("sp_out"), (((s * NSPLIT + j) * H + h) * HD) // 2 + tq, 1)
+                for j in range(NSPLIT)
             ]
         )
-        part = fx.Float32(0.0)
-        for q in range_constexpr(NQ):
-            jj = grp + q * GRP
-            w = lds_ld(misc, fx.min(jj, NSPLIT - 1))
-            part = part + (jj < NSPLIT).select(
-                w * accs[q][0].bitcast(fx.Float32), fx.Float32(0.0)
-            )
-        lds_st(red, tid, part)
-        gpu.barrier()
-        if tid < MT:
-            num = fx.Float32(0.0)
-            for gq in range_constexpr(GRP):
-                num = num + lds_ld(red, gq * MT + tid)
-            o = bf16_round(num * rcp(lsum))
-            gate = poll([(mb("qg"), s * QG + h * 2 * HD + HD + dt * MT + tid, 1)])[0][
-                0
-            ].bitcast(fx.Float32)
-            lds_st(outs, tid, bf16_round(o * sigmoid(gate)))
-        gpu.barrier()
-        if tid < MT // 2:
-            put_bf(
-                mb("gated"),
-                s * OUT_K + h * HD + dt * MT + 2 * tid,
-                [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)],
-            )
+        o0 = fx.Float32(0.0)
+        o1 = fx.Float32(0.0)
+        for j in range_constexpr(NSPLIT):
+            v0, v1 = bf2_f32(parts[j][0])
+            wj = lds_ld(misc, j)
+            o0 = fmath.fma(v0, wj, o0)
+            o1 = fmath.fma(v1, wj, o1)
+        gates = poll([(mb("qg"), s * QG + h * 2 * HD + HD + 2 * tq, 2)])[0]
+        sg = [sigmoid_precise(gates[e].bitcast(fx.Float32)) for e in range(2)]
+        if tid < HD // 2:
+            if const_expr(
+                QKF_O
+            ):  # quantized for o_proj from f32 (ATOM's sigmoid * mul + quant)
+                put2(
+                    mb("gated"),
+                    s * OUT_K + h * HD + 2 * tq,
+                    sg[0] * bf16_round(o0),
+                    sg[1] * bf16_round(o1),
+                )
+            else:
+                # ATOM's torch.sigmoid then * on bf16 tensors: the sigmoid and the product each bf16
+                put_bf(
+                    mb("gated"),
+                    s * OUT_K + h * HD + 2 * tq,
+                    [
+                        bf16_round(bf16_round(sg[e]) * bf16_round(o))
+                        for e, o in enumerate((o0, o1))
+                    ],
+                )
     return {}
