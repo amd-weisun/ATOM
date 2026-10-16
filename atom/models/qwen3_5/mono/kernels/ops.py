@@ -96,6 +96,10 @@ def log(value):
     return _hardware_f32("llvm.amdgcn.log.f32", value) * 0.6931471805599453
 
 
+def exp2(value):
+    return _hardware_f32("llvm.amdgcn.exp2.f32", fx.Float32(value))
+
+
 def xshfl(value, offset):
     """Return the value from ``lane ^ offset`` using VALU/DPP operations."""
 
