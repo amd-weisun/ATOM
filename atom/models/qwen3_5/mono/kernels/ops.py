@@ -86,6 +86,16 @@ def exp(value):
     return _hardware_f32("llvm.amdgcn.exp2.f32", fx.Float32(value) * 1.4426950408889634)
 
 
+def sqrt(value):
+    """``v_sqrt_f32``: Triton's ``tl.sqrt`` on gfx950."""
+    return _hardware_f32("llvm.amdgcn.sqrt.f32", value)
+
+
+def log(value):
+    """``v_log_f32`` (log2) times ln 2: Triton's ``tl.log`` on gfx950."""
+    return _hardware_f32("llvm.amdgcn.log.f32", value) * 0.6931471805599453
+
+
 def xshfl(value, offset):
     """Return the value from ``lane ^ offset`` using VALU/DPP operations."""
 

@@ -10,7 +10,14 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.qwen3_5.mono.kernels.common import sigmoid, silu
+from atom.models.qwen3_5.mono.kernels.common import (
+    div_rn,
+    fp8_word,
+    quant_rule_q3,
+    sigmoid,
+    sigmoid_fast,
+    silu,
+)
 from atom.models.qwen3_5.mono.kernels.helpers import traced
 from atom.models.qwen3_5.mono.kernels.ops import (
     bf16_round,
@@ -19,8 +26,10 @@ from atom.models.qwen3_5.mono.kernels.ops import (
     ld_f32,
     lds_ld,
     lds_st,
+    log,
     rsq,
     rsrc,
+    sqrt,
     uniform,
     xshfl,
 )
@@ -49,6 +58,7 @@ def gdn_stages(ctx):
     HV = ctx["HV"]
     KEY_DIM = ctx["KEY_DIM"]
     K_DIM = ctx["K_DIM"]
+    MX = ctx["MX"]
     S = ctx["S"]
     REPLAY = ctx["REPLAY"]
     T_SEQ = ctx["T_SEQ"]
@@ -112,7 +122,13 @@ def gdn_stages(ctx):
         wv = fx.Vector(bo.buffer_load(r_wc, ch * 4, vec_width=4, dtype=T.bf16)).to(
             fx.Float32
         )
-        acc = cs[0] * wv[0] + cs[1] * wv[1] + cs[2] * wv[2] + x * wv[3]
+        # ATOM's causal_conv1d_update: each bf16 x bf16 tap product rounded to bf16, summed in f32, oldest first
+        acc = (
+            bf16_round(cs[0] * wv[0])
+            + bf16_round(cs[1] * wv[1])
+            + bf16_round(cs[2] * wv[2])
+            + bf16_round(x * wv[3])
+        )
         if ok:
             for j, val in ((0, cs[1]), (1, cs[2]), (2, x)):
                 bo.buffer_store(
@@ -143,10 +159,10 @@ def gdn_stages(ctx):
             )
             for j in range_constexpr(T_SEQ):
                 acc = (
-                    win[j] * wv[0]
-                    + win[j + 1] * wv[1]
-                    + win[j + 2] * wv[2]
-                    + win[j + 3] * wv[3]
+                    bf16_round(win[j] * wv[0])
+                    + bf16_round(win[j + 1] * wv[1])
+                    + bf16_round(win[j + 2] * wv[2])
+                    + bf16_round(win[j + 3] * wv[3])
                 )
                 put(
                     mb("conv"),
@@ -246,7 +262,7 @@ def gdn_stages(ctx):
             for j in range(KPT)
         ]
         if const_expr(REPLAY):
-            # S_h: the checkpoint decayed by e^{C}, plus each record weighted by e^{C - C_j}; fp32, as ATOM's
+            # S_h: the checkpoint decayed by e^{C}, plus each record weighted by e^{C - C_j}, as ATOM's
             # replay. The gates are wave-uniform (scalar registers); the records run as a loop over the h live
             # ones, the state carried: unrolled over all CAP, their loads hoisted together spill at S = 8.
             r_g0 = rsrc(rec_g + rec0 * 4)
@@ -279,14 +295,18 @@ def gdn_stages(ctx):
                 ur = fx.Vector(
                     bo.buffer_load(r_u0, jj * V_DIM + v0_, vec_width=VPT, dtype=T.bf16)
                 ).to(fx.Float32)
-                st = [
-                    fx.math.fma(
-                        fx.Vector.filled(VPT, kr[i // 8][i % 8] * w, fx.Float32),
-                        ur,
-                        fx.Vector(acc[i]),
+                # ATOM's replay dot (DOT_MODE 2): k e^{C - C_j} split into bf16 hi + lo, each times the bf16 u
+                st = []
+                for i in range_constexpr(KPT):
+                    kw = kr[i // 8][i % 8] * w
+                    hi = bf16_round(kw)
+                    lo = bf16_round(kw - hi)
+                    part = fx.math.fma(
+                        fx.Vector.filled(VPT, hi, fx.Float32), ur, fx.Vector(acc[i])
                     )
-                    for i in range(KPT)
-                ]
+                    st.append(
+                        fx.math.fma(fx.Vector.filled(VPT, lo, fx.Float32), ur, part)
+                    )
                 res = yield st + [cj]
             sv = [fx.Vector(res[i]) for i in range(KPT)]
             if flush & live:
@@ -330,9 +350,10 @@ def gdn_stages(ctx):
             gpu.barrier()
             b_in = lds_ld(xs, XB)
             a_in = lds_ld(xs, XB + 1)
-            beta = sigmoid(b_in)
+            # ATOM's fused_gdn_gating: beta stored as bf16, softplus log(1 + exp(x)) up to 20
+            beta = bf16_round(sigmoid(b_in))
             x_sp = a_in + dtb
-            softplus = (x_sp > 20.0).select(x_sp, fmath.log1p(exp(x_sp)))
+            softplus = (x_sp > 20.0).select(x_sp, log(1.0 + exp(x_sp)))
             g_log = -exp(alog) * softplus
             decay = exp(g_log)
             # this thread's KPT q / k (L2-normalized over the head: sums over the KL lanes)
@@ -348,53 +369,82 @@ def gdn_stages(ctx):
             kk = [kx[j // 4][j % 4] for j in range(KPT)]
             qsq = fx.Float32(0.0)
             ksq = fx.Float32(0.0)
-            kq = fx.Float32(0.0)
             for j in range_constexpr(KPT):
                 qsq = qsq + qq[j] * qq[j]
                 ksq = ksq + kk[j] * kk[j]
-                kq = kq + kk[j] * qq[j]
-            q_scale = rsq(_sum8(qsq) + 1.0e-6) * (K_DIM**-0.5)
-            k_scale = rsq(_sum8(ksq) + 1.0e-6)
-            qq = [x * q_scale for x in qq]
-            kk = [x * k_scale for x in kk]
-            dot_kq = _sum8(kq) * q_scale * k_scale
-            # decay, S^T k and S^T q over this thread's k (VPT v at once), summed over the KL lanes
+            # ATOM's recurrence: x / sqrt(sum x^2 + 1e-6), then q * K^-0.5
+            q_den = sqrt(_sum8(qsq) + 1.0e-6)
+            k_den = sqrt(_sum8(ksq) + 1.0e-6)
+            # x / den as the IEEE divide rounds it, at a reciprocal's cost (common.div_rn)
+            rq, rk = 1.0 / q_den, 1.0 / k_den
+            qq = [div_rn(x, q_den, rq) * (K_DIM**-0.5) for x in qq]
+            kk = [div_rn(x, k_den, rk) for x in kk]
+            # decay and S^T k over this thread's k (VPT v at once), summed over the KL lanes
             dvec = fx.Vector.filled(VPT, decay, fx.Float32)
             skp = fx.Vector.filled(VPT, 0.0, fx.Float32)
-            sqp = fx.Vector.filled(VPT, 0.0, fx.Float32)
             for j in range_constexpr(KPT):
                 sv[j] = sv[j] * dvec
                 skp = fx.math.fma(sv[j], fx.Vector.filled(VPT, kk[j], fx.Float32), skp)
-                sqp = fx.math.fma(sv[j], fx.Vector.filled(VPT, qq[j], fx.Float32), sqp)
             vin = fx.Vector(fx.ptr_load(xs + (XV + v0_), result_type=vvf))
             delta = [(vin[e] - _sum8(skp[e])) * beta for e in range(VPT)]
             dv = fx.Vector.from_elements(delta, fx.Float32)
+            sqp = fx.Vector.filled(VPT, 0.0, fx.Float32)
             for j in range_constexpr(KPT):
                 sv[j] = fx.math.fma(fx.Vector.filled(VPT, kk[j], fx.Float32), dv, sv[j])
-            outs_v = [bf16_round(_sum8(sqp[e]) + delta[e] * dot_kq) for e in range(VPT)]
+                sqp = fx.math.fma(sv[j], fx.Vector.filled(VPT, qq[j], fx.Float32), sqp)
+            # o = S_new^T q, stored bf16
+            outs_v = [bf16_round(_sum8(sqp[e])) for e in range(VPT)]
             # gated RMSNorm over the head's V_DIM outputs (lane kg 0 of each group holds its VPT once)
             ssq = fx.Float32(0.0)
             for e in range_constexpr(VPT):
-                ssq = ssq + outs_v[e] * outs_v[e]
-            rstd = rsq(
-                block_sum((kg == 0).select(ssq, fx.Float32(0.0))) * (1.0 / V_DIM) + EPS
-            )
+                o2 = outs_v[e] * outs_v[e]
+                ssq = ssq + (bf16_round(o2) if const_expr(MX) else o2)
+            var = block_sum((kg == 0).select(ssq, fx.Float32(0.0))) * (1.0 / V_DIM)
+            if const_expr(MX):
+                # ATOM's RMSNormGated.forward_native on bf16 tensors: x.pow(2), the mean, + eps and
+                # rsqrt each round to bf16
+                rstd = bf16_round(rsq(bf16_round(bf16_round(var) + EPS)))
+            else:
+                rstd = rsq(var + EPS)
             if kg == 0:
                 for e in range_constexpr(VPT):
                     v_idx = v0_ + e
-                    nrm = bf16_round(outs_v[e] * rstd)
-                    gated = bf16_round(
-                        bf16_round(nrm * ld_f32(r_gn, v_idx))
-                        * silu(lds_ld(xs, XZ + v_idx))
-                    )
+                    z = lds_ld(xs, XZ + v_idx)
+                    if const_expr(MX):
+                        nrm = bf16_round(outs_v[e] * rstd)
+                        # torch's SiLU: z / (1 + expf(-z)), accurate expf, bf16
+                        sz = bf16_round(z / (1.0 + fmath.exp(-z)))
+                        gated = bf16_round(bf16_round(nrm * ld_f32(r_gn, v_idx)) * sz)
+                    else:
+                        # (x * w) * inv_std * silu(z) in f32 (-ffast-math: v_rcp in the sigmoid)
+                        gated = (outs_v[e] * ld_f32(r_gn, v_idx) * rstd) * (
+                            z * sigmoid_fast(z)
+                        )
                     lds_st(outs, v_idx, ok.select(gated, fx.Float32(0.0)))
             gpu.barrier()
-            if tid < V_DIM // 2:
-                put_bf(
-                    mb("gated"),
-                    s * VALUE_DIM + h * V_DIM + 2 * tid,
-                    [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)],
+            if const_expr(MX):
+                if tid < V_DIM // 2:
+                    put_bf(
+                        mb("gated"),
+                        s * VALUE_DIM + h * V_DIM + 2 * tid,
+                        [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)],
+                    )
+            elif tid < V_DIM // 4:  # the head is one 128-block: Q3 FP8 for out_proj
+                g4 = [lds_ld(outs, 4 * tid + e) for e in range(4)]
+                amax = fx.max(
+                    fx.max(fmath.absf(g4[0]), fmath.absf(g4[1])),
+                    fx.max(fmath.absf(g4[2]), fmath.absf(g4[3])),
                 )
+                for o in (1, 2, 4, 8, 16):
+                    amax = fx.max(amax, xshfl(amax, o))
+                sc, q = quant_rule_q3(amax)
+                put(
+                    mb("gq"),
+                    (s * VALUE_DIM + h * V_DIM) // 4 + tid,
+                    fp8_word(q(g4[0]), q(g4[1]), q(g4[2]), q(g4[3])),
+                )
+                if tid == 0:
+                    put(mb("gqs"), s * (VALUE_DIM // 128) + h * (V_DIM // 128), sc)
             # the new state after the publish: out_proj waits on the gated row, not on this store
             if const_expr(REPLAY):
                 # this token's record (k normalized, u = beta (v - S^T k), the log-decay g) at rbase + tok

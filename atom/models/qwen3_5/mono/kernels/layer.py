@@ -42,7 +42,6 @@ from atom.models.qwen3_5.mono.kernels.step import LAYER_SLOTS
 from atom.models.qwen3_5.mono.layout import (
     BLOCKS,
     BS,
-    KT,
     MOE_MISC,
     PROJ_GROUPS,
     PROJ_TILE,
@@ -54,8 +53,8 @@ from atom.models.qwen3_5.mono.layout import (
     dn_tile,
     gdn_dims,
     layout,
-    n_split,
     out_k,
+    pa_splits,
     router_rows,
     stage_tasks,
 )
@@ -81,6 +80,7 @@ def build_qwen35_kernel(
     eps,
     rope_dim,
     weights="fp8",
+    qk_fusion=False,
     tokens_per_seq=1,
     replay_cap=0,
 ):
@@ -128,11 +128,6 @@ def build_qwen35_kernel(
     N_ROUTER = ROUTER_ROWS // ROUTER_TILE
     ID_BITS = max(8, (N_EXPERTS - 1).bit_length())
     ID_MASK = (1 << ID_BITS) - 1
-    _off, TOPK_SUM_OFFS = 1, []
-    while _off < TOP_K:
-        TOPK_SUM_OFFS.append(_off)
-        _off *= 2
-    TOPK_SUM_OFFS = tuple(TOPK_SUM_OFFS)
     XQ_BLOCKS = HIDDEN // 128
     PUBLISH_BLOCKS = XQ_BLOCKS
     XQ_WAVES = (PUBLISH_BLOCKS + N_ROUTER - 1) // N_ROUTER
@@ -143,19 +138,21 @@ def build_qwen35_kernel(
     N_DN_TILES = HIDDEN // DN_TILE
     # full attention: this rank's query heads share its one K / V head
     FULL = full
+    QKF = bool(qk_fusion) and full
+    QKF_O = (
+        QKF and weights == "fp8"
+    )  # o_proj's input quantized from f32 (its W8A8 checkpoint)
     H, HD, ROPE = heads, head_dim, rope_dim
     KVD = HD
     QG = H * 2 * HD
     SCALE = HD**-0.5
-    NSPLIT = n_split(S)
-    KROWE = HD + 8  # bf16 elements per query row in kvt, padded off the bank
+    NSPLIT = pa_splits(S // T_SEQ)
+    CPS = 256  # keys of a decode-attention partition (aiter's CONTEXT_PARTITION_SIZE)
     if FULL:
         assert H == WAVES, "split attention runs one query head per wave"
         assert HD % 64 == 0 and HD <= 512 and ROPE % 2 == 0 and ROPE <= HD
-        assert (
-            BS == 16 and KT == 64
-        ), "a tile is 4 cache blocks: a key row group per wave quarter"
-        assert (H * HD) % 512 == 0 and NSPLIT <= 512
+        assert BS == 16 and HD == 256 and CPS == 256, "a partition is 16 cache blocks"
+        assert NSPLIT <= 64 and T_SEQ <= 4
     OUT_K = out_k(
         full,
         {
@@ -182,17 +179,35 @@ def build_qwen35_kernel(
         "top_k": top_k,
         "inter": inter,
         "weights": weights,
+        "qk_fusion": qk_fusion,
     }
-    SC, SY = layout(S, W, full, **dims)
+    SC, SY = layout(S, W, full, tokens_per_seq=T_SEQ, **dims)
     stages = stage_tasks(S, full, tokens_per_seq=T_SEQ, **dims)
     base, acc = {}, 0
     for name, n in stages:
         base[name] = acc % G
         acc += n
     XN = max(
-        S * HIDDEN // 2, 1024, (16 * KT + 32 + 2 * HD + 2) if FULL else 0
-    )  # split: P | rescale | new K / V
-    ON = max(S * max(ROW_TILE, PROJ_TILE * PROJ_GROUPS, DN_TILE), V_DIM, HD)
+        S * HIDDEN // 2,
+        1024,
+        (
+            (
+                16 * (CPS + 1 + CPS // 4 + 2 + HD // 4 + 2)
+                + 64
+                + T_SEQ * HD // 2
+                + 2 * T_SEQ
+            )
+            if FULL
+            else 0
+        ),
+    )  # split: scores | P' bytes | Q bytes | per-head factors | this launch's K / V bytes, scales
+    ON = max(
+        # MXFP4: the expert down's routed tile and, after it, the shared expert's
+        S * max(ROW_TILE, PROJ_TILE * PROJ_GROUPS, DN_TILE * (2 if MX else 1)),
+        V_DIM,
+        HD,
+        H * HD if FULL else 0,  # a split's output, every head
+    )
     MISC = max(MOE_MISC + S * XQ_BLOCKS, S * MOE_SLOTS * INTER // 128, 2 * NSPLIT) + 8
 
     @fx.struct
@@ -205,9 +220,6 @@ def build_qwen35_kernel(
         misc: fx.Array[fx.Float32, MISC, 16]
         keys: fx.Array[fx.Int32, S * MOE_SLOTS, 16]
         dnw: fx.Array[fx.Float32, S * MOE_SLOTS, 16]
-        kvt: fx.Array[
-            fx.BFloat16, (16 * KROWE) if FULL else 8, 16
-        ]  # the attention's query, 16 padded rows
 
     # the stages read this build's constants from bc; _cache_tag puts them in the JIT cache key,
     # with the digest of the shared helper sources (outside this directory, so outside the key)
@@ -279,7 +291,6 @@ def build_qwen35_kernel(
         misc = lds.misc.ptr
         keys = lds.keys.ptr
         dnw = lds.dnw.ptr
-        kvt = lds.kvt.ptr
         # the full-attention projection's matrix comes in the GDN qkvz slot
         w_qkv, s_qkv = w_qkvz, s_qkvz
         # this launch's epoch: a per-step device counter, unique per layer

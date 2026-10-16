@@ -71,6 +71,9 @@ class Q35Config:
     # (amd/Qwen3.5-397B-A17B-MXFP4: MXFP4 routed experts on MXFP4 activations, A4W4; BF16 projections,
     # a separate BF16 shared expert)
     weights: str = "fp8"
+    # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION: the original attention's fused q / k norm + RoPE +
+    # cache-quant kernel (one bf16 rounding; its KV and o_proj input quants), which the kernel follows
+    qk_fusion: bool = False
 
     def at_rank(self, rank: int) -> Q35Config:
         return replace(self, rank=rank)

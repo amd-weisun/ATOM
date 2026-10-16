@@ -111,3 +111,69 @@ def test_every_stage_has_tasks_and_gdn_runs_a_task_per_sequence_head(
             assert tasks["ug"] == tokens * dims["top_k"] * dims["inter"] // layout.UG8
             if not full:
                 assert tasks["gdn"] == tokens // tokens_per_seq * dims["hv"]
+
+
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("full", [False, True], ids=["gdn", "full"])
+def test_mixer_output_mailboxes_follow_the_out_proj_input(weights, full):
+    """The FP8 checkpoint's GDN output is FP8 already (its gated norm quantizes, as aiter's does): four
+    bytes a pair and a scale per 128; every other mixer output is bf16 pairs. ``a`` holds the f32 stream.
+    """
+    dims = _dims(weights)
+    tokens = 4
+    scratch, _ = layout.layout(tokens, 4, full, **dims)
+    sizes = {name: end - start for name, start, end in _regions(scratch)}
+    out_k = layout.out_k(full, dims)
+    if full or weights == "mxfp4":
+        assert "gq" not in sizes and sizes["gated"] >= tokens * out_k // 2 * 8
+    else:
+        assert "gated" not in sizes
+        assert sizes["gq"] >= tokens * out_k // 4 * 8
+        assert sizes["gqs"] >= tokens * out_k // 128 * 8
+    assert sizes["a"] >= tokens * dims["hidden"] * 8
+
+
+# the BF16 GEMMs whose baseline partial-sum rounding the kernel takes: TP 4 per-rank (N, K)
+_BF16_GEMMS = {"out": (4096, 2048), "shared_ug": (512, 4096), "router": (513, 4096)}
+
+
+def _rule_of_aiter_pick(cfg: dict) -> tuple:
+    """The partial-sum rounding of an aiter tuned_gemm pick (see ``layout.BF16_GEMM_RULES``)."""
+    name = cfg.get("kernelName") or ""
+    if cfg.get("libtype") == "flydsl":
+        params = name.split("_")
+        tile = next(p for p in params if p.startswith("t") and "x" in p)
+        ks = next(p for p in params if p.startswith("ks"))
+        waves = next(p for p in params if p.startswith("w") and "x" in p)
+        k_waves = int(waves[1:].split("x")[2])
+        split_k = 1 if ks == "ks1" else int(cfg["splitK"])
+        assert (split_k == 1) or (k_waves == 1), name
+        if split_k > 1:
+            return ("splitk", split_k)
+        if k_waves == 2 and tile.split("x")[2] == "256":
+            return ("halves",)
+        assert k_waves == 1, name
+    return ("single",)
+
+
+@pytest.mark.parametrize("name", sorted(_BF16_GEMMS))
+def test_bf16_gemm_rules_match_aiters_tuned_picks(name):
+    """A re-tune of aiter's BF16 GEMM configs can change which partial sums baseline ATOM rounds: the
+    pinned table must follow the installed aiter (needs its gfx950 tuned configs, so a GPU).
+    """
+    tg = pytest.importorskip("aiter.tuned_gemm")
+    if not torch.cuda.is_available():
+        pytest.skip("aiter's tuned config lookup reads the GPU's CU count")
+    N, K = _BF16_GEMMS[name]
+    for M in range(1, 17):
+        cfg = tg.get_GEMM_A16W16_config(
+            M, N, K, False, "torch.bfloat16", "torch.bfloat16", False, False
+        )
+        assert layout.BF16_GEMM_RULES[name][M] == _rule_of_aiter_pick(cfg), (M, cfg)
+
+
+@pytest.mark.parametrize("tokens", TOKEN_COUNTS)
+def test_baseline_m_is_the_graph_padded_decode_batch(tokens):
+    m = layout.baseline_m(tokens)
+    assert m == (tokens if tokens <= 8 else 16)
+    assert layout.baseline_m(tokens, tokens_per_seq=4) == tokens

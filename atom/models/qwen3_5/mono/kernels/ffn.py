@@ -11,10 +11,14 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from atom.models.qwen3_5.mono.kernels.common import mxfp4_qd, quant_floor, sigmoid, silu
+from atom.models.qwen3_5.mono.kernels.common import (
+    mxfp4_qd,
+    quant_floor,
+    sigmoid_precise,
+    silu,
+)
 from atom.models.qwen3_5.mono.kernels.helpers import traced
 from atom.models.qwen3_5.mono.kernels.ops import (
-    bf2_f32,
     bf16_pair,
     bf16_round,
     ld_f32,
@@ -30,6 +34,7 @@ from atom.models.qwen3_5.mono.layout import (
     ROUTER_TILE,
     UG8,
     WAVES,
+    bf16_gemm_rule,
     router_spt,
 )
 
@@ -134,19 +139,22 @@ def ffn_stages(ctx):
         xa = []
 
         def ld_a(sks):
-            # sks = (local sample s, k) pairs; local sample s is sample rs0 + s
+            # sks = (local sample s, k) pairs; local sample s is sample rs0 + s. Mailbox ``a`` holds the
+            # f32 post-attention stream (one value a pair): the norm's operand, unrounded
             n4 = len(sks)
-            specs = [
-                (mb("a"), (fx.min(rs0 + s, S - 1) * HIDDEN + k) // 2, 2) for s, k in sks
-            ]
+            specs = []
+            for s, k in sks:
+                i = fx.min(rs0 + s, S - 1) * HIDDEN + k
+                specs += [(mb("a"), i, 2), (mb("a"), i + 2, 2)]
             specs += [
-                (mb("a"), (fx.min(rs0 + s, S - 1) * HIDDEN + xk) // 2, 1)
-                for s in range(SPT)
+                (mb("a"), fx.min(rs0 + s, S - 1) * HIDDEN + xk, 2) for s in range(SPT)
             ]
-            v = poll(specs, batch=len(specs))
+            # f32 pairs: past 8 samples in two rounds, or their registers spill
+            v = poll(specs, batch=len(specs) if S <= 8 else max(1, len(specs) // 2))
+            f = [[w[0].bitcast(fx.Float32), w[1].bitcast(fx.Float32)] for w in v]
             for s in range_constexpr(SPT):
-                xa.append(bf2_f32(v[n4 + s][0]))
-            return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in v[:n4]]
+                xa.append(tuple(f[2 * n4 + s]))
+            return [f[2 * i] + f[2 * i + 1] for i in range(n4)]
 
         rstds = stage_x_gemma(ld_a, HIDDEN, g_post1, count=SPT)
         for s_l in range_constexpr(SPT):
@@ -206,7 +214,11 @@ def ffn_stages(ctx):
             s_ = wave + j * WAVES
             if s_ < S:
                 e, w = route_softmax(s_)
-                sg = sigmoid(getf(mb("scores"), s_ * ROUTER_ROWS + N_EXPERTS))
+                # the shared expert's weight: aiter's top-k kernel's f32 sigmoid of the bf16 logit (FP8
+                # checkpoint, slot 512 of the fused bank); torch's, to bf16, for the MXFP4 checkpoint
+                sg = sigmoid_precise(getf(mb("scores"), s_ * ROUTER_ROWS + N_EXPERTS))
+                if const_expr(MX):
+                    sg = bf16_round(sg)
                 if lane < MOE_SLOTS:
                     q = s_ * MOE_SLOTS + (lane + 1) % MOE_SLOTS
                     lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e))
@@ -216,6 +228,8 @@ def ffn_stages(ctx):
 
     # ================================ 6. expert up/gate + SiLU (W8A8; MXFP4: A4W4 and the BF16 shared expert)
     UG_NKC = HIDDEN // 64
+    # the MXFP4 checkpoint's BF16 shared gate_up (wave w: K range w of WAVES) rounds as baseline ATOM's GEMM
+    SH_UG_RULE = bf16_gemm_rule("shared_ug", S, ctx["T_SEQ"]) if MX else None
     UG_W_BYTES = 2 * INTER * HIDDEN
     UG_S_BYTES = 2 * INTER // 128 * (HIDDEN // 128) * 4
     # MXFP4 bank: packed E2M1 [2 INTER, HIDDEN / 2], E8M0 [2 INTER, HIDDEN / 32 padded to 8]
@@ -411,6 +425,7 @@ def ffn_stages(ctx):
                     1,
                     mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre),
                     emit_out(16),
+                    rule=SH_UG_RULE,
                 )
                 gpu.barrier()
                 ug8_emit(c0, slot0, 0, True, live0)
@@ -521,7 +536,7 @@ def ffn_stages(ctx):
             )
 
         def sh_dn_unit():
-            """The BF16 shared expert's down for every sample (B columns), weighted by its sigmoid gate."""
+            """The BF16 shared expert's down for every sample (B columns), unweighted: its own GEMM."""
             chunk = wave % DN_WPR
             kc = fx.min(chunk, SH_DN_CHUNKS - 1)
             n = n_sel()
@@ -533,9 +548,7 @@ def ffn_stages(ctx):
                 (n * MOE_SLOTS * INTER + kc * 64) // 2,
                 dn_ln,
             )
-            w = (chunk < SH_DN_CHUNKS).select(
-                lds_ld(dnw, n * MOE_SLOTS), fx.Float32(0.0)
-            )
+            w = (chunk < SH_DN_CHUNKS).select(fx.Float32(1.0), fx.Float32(0.0))
             return (u[0], u[1], w, u[3])
 
         # the experts are known: stream their down weights while up/gate finishes
@@ -555,10 +568,10 @@ def ffn_stages(ctx):
                 blk = wave + (r0 + b) * WAVES
                 if blk < DN_BLK:
                     if const_expr(MX):
-                        # bf16 (the expert stage's output), the routed slots per-32 MXFP4 (A4W4); bf16
-                        # values in LDS, K order
+                        # the routed slots per-32 MXFP4 (A4W4) from the f32 silu * up, as aiter's stage-1
+                        # epilogue quantizes; the shared expert's (a BF16 MLP) bf16; bf16 values in LDS, K order
+                        m0, m1 = mxfp4_qd(mids[b][0], mids[b][1])
                         v0, v1 = bf16_round(mids[b][0]), bf16_round(mids[b][1])
-                        m0, m1 = mxfp4_qd(v0, v1)
                         sh = (blk // DN_UNITS_PER_SLOT) % MOE_SLOTS == 0
                         lds_st(
                             xs,
@@ -575,22 +588,38 @@ def ffn_stages(ctx):
         gpu.barrier()
         acc = run_units(u_dn, DN_UPW, DN_BATCH, pre)
         if const_expr(MX):
-            acc = mma_units(acc, [sh_dn_unit()])
+            # baseline ATOM's MoE block on the MXFP4 checkpoint: the shared expert apart (BF16 MLP, its
+            # down bf16), times the bf16 sigmoid gate (bf16), plus the routed experts' bf16 output (bf16)
+            sh_acc = mma_units([fx.Float32(0.0) for _ in range(4)], [sh_dn_unit()])
+
+            def emit_sh(rl, n, v):
+                if (rl >= dn_off) & (rl < dn_off + DN_TILE):
+                    lds_st(outs, (S + n) * DN_TILE + rl - dn_off, bf16_round(v))
+
+            reduce_rows(DN_R, sh_acc, emit_sh)
+            gpu.barrier()
+
+        def sh_combine(n, i_, v):
+            sh = bf16_round(lds_ld(dnw, n * MOE_SLOTS) * lds_ld(outs, S * DN_TILE + i_))
+            return bf16_round(sh + bf16_round(v))
 
         def emit_dn(rl, n, v):
             if (rl >= dn_off) & (rl < dn_off + DN_TILE):
-                lds_st(outs, n * DN_TILE + rl - dn_off, v)
+                i_ = n * DN_TILE + rl - dn_off
+                lds_st(outs, i_, sh_combine(n, i_, v) if MX else v)
 
         reduce_rows(DN_R, acc, emit_dn)
         gpu.barrier()
 
         def store_x(s, row, v0, v1):
+            # the layer's output: the f32 stream (the next input norm's operand; its bf16 rounding is
+            # the stored residual)
             bo.buffer_store(
-                fx.Vector.from_elements([v0, v1], fx.Float32).to(fx.BFloat16),
+                fx.Vector.from_elements([v0, v1], fx.Float32),
                 rsrc(x_out),
                 s * HIDDEN + row,
             )
 
-        peer_reduce("ffn", t, mb("a"), store_x, tile=DN_TILE)
+        peer_reduce("ffn", t, mb("a"), store_x, tile=DN_TILE, residual_f32=True)
         gpu.barrier()
     return {}

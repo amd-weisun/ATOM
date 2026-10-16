@@ -24,6 +24,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom.models.qwen3_5.mono.check import forward_checked
 from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config
 from atom.mono.plan.shard import Shard, ShardError
 from atom.mono.runtime.consensus import MonoUnsupported
@@ -78,6 +79,15 @@ class Dims:
         shard.split(hf.linear_num_key_heads, "GDN key heads")
         shard.split(hf.num_attention_heads, "attention heads")
         shard.split(hf.moe_intermediate_size, "expert intermediate")
+
+
+def final_norm(norm, x):
+    """Gemma RMSNorm of the f32 residual stream ``x`` -> bf16: ``x * rsqrt(mean(x^2) + eps) * (1 + w)``
+    in f32, rounded once (the original path's fused all-reduce norm on ``residual + bf16(sum)``).
+    """
+    return norm.forward_static(norm.weight.data, norm.variance_epsilon, x, None).to(
+        torch.bfloat16
+    )
 
 
 def spec_steps(atom_config) -> int:
@@ -166,6 +176,8 @@ class MonoDecodeModel(nn.Module):
             and step_supported(input_ids, self._runner.T, self._runner.replay_cap > 0)
             and self._mono.ready(input_ids.numel())
         ):
+            if envs.ATOM_MONO_CHECK:
+                return forward_checked(self._mono.runner, input_ids, positions)
             return self._mono.runner.forward(input_ids, positions)
         return self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kw
@@ -220,8 +232,8 @@ class MonoDraftModel(nn.Module):
             e = m.pre_fc_norm_embedding(m.embed_input_ids(input_ids))
             h = m.pre_fc_norm_hidden(hidden_states)
             h = get_tp_group().all_gather(m.fc(torch.cat([e, h], dim=-1)))
-            out = m.norm(self._runner.layer(h, positions))
-            return out[0] if isinstance(out, tuple) else out
+            # the layer's f32 stream is what the original draft's add + norm normalizes
+            return final_norm(m.norm, self._runner.layer(h, positions))
         return self.model(
             input_ids,
             positions,

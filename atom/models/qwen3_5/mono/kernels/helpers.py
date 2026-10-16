@@ -31,6 +31,7 @@ from atom.models.qwen3_5.mono.kernels.ops import (
     WAVES,
     bf2_f32,
     bf16_pair,
+    bf16_round,
     f8_word,
     fp8_to_bf16x8,
     ld_f32,
@@ -428,6 +429,9 @@ def mma_units(st, acc, units):
                 c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
         if const_expr(coef is None):
             acc = [acc[e] + c[e] for e in range(4)]
+        elif const_expr(unit_format == "f8f8"):
+            # aiter's blockscale GEMMs: c = fma(block partial, a_scale * w_scale, c)
+            acc = [fmath.fma(c[e], coef, acc[e]) for e in range(4)]
         else:
             acc = [acc[e] + c[e] * coef for e in range(4)]
     return acc
@@ -450,9 +454,61 @@ def run_units(st, make_unit, cpw, batch, pre=None):
     return acc
 
 
+def bf16_combine(rule, parts):
+    """The sum of a BF16 GEMM's per-wave fp32 partials ``parts`` (each a contiguous K share, in K order)
+    as baseline ATOM's GEMM rounds it (``layout.BF16_GEMM_RULES``): ``("single",)`` one fp32 sum;
+    ``("splitk", n)`` n equal K ranges, each rounded to bf16 and added into a bf16 sum in range order;
+    ``("halves",)`` the even and the odd partials (each 256-wide K tile's first / second 128) summed,
+    rounded to bf16 and added, bf16."""
+    W = len(parts)
+    if const_expr(rule[0] == "single"):
+        tot = parts[0]
+        for j in range_constexpr(1, W):
+            tot = tot + parts[j]
+        return tot
+    if const_expr(rule[0] == "halves"):
+        assert W % 2 == 0, W
+        h0 = parts[0]
+        h1 = parts[1]
+        for j in range_constexpr(2, W, 2):
+            h0 = h0 + parts[j]
+            h1 = h1 + parts[j + 1]
+        return bf16_round(bf16_round(h0) + bf16_round(h1))
+    assert rule[0] == "splitk" and W % rule[1] == 0, (rule, W)
+    per = W // rule[1]
+    acc = fx.Float32(0.0)
+    for i in range_constexpr(rule[1]):
+        t = parts[i * per]
+        for j in range_constexpr(1, per):
+            t = t + parts[i * per + j]
+        # the zeroed bf16 output plus the first range is that range's rounding
+        acc = bf16_round(acc + bf16_round(t))
+    return acc
+
+
+def _wave_parts(red, wpr, rl, n, r):
+    """The wpr waves' partials of output (row rl, column n) in ``red``, in wave (K) order."""
+    parts = []
+    for j in range(wpr):
+        ww = (rl // 16) * wpr + j
+        parts.append(lds_ld(red, (ww * 64 + n + 16 * (r // 4)) * 4 + r % 4))
+    return parts
+
+
+def _wave_total(rule, parts):
+    if rule is None:
+        tot = fx.Float32(0.0)
+        for p in parts:
+            tot = tot + p
+        return tot
+    return bf16_combine(rule, parts)
+
+
 @traced
-def reduce_rows(st, R, acc, emit, count=None):
-    """Sum per-wave MFMA tiles; emit(row_local, local sample column, value)."""
+def reduce_rows(st, R, acc, emit, count=None, rule=None):
+    """Sum per-wave MFMA tiles; emit(row_local, local sample column, value). With ``rule`` (a BF16 GEMM's,
+    see ``bf16_combine``) the waves' partials are combined as baseline ATOM's GEMM rounds them.
+    """
     S = st.S
     lane = st.lane
     red = st.red
@@ -469,11 +525,7 @@ def reduce_rows(st, R, acc, emit, count=None):
             rl = t % (R * 16)
             n = t // (R * 16)
             r = rl % 16
-            tot = fx.Float32(0.0)
-            for j in range_constexpr(wpr):
-                ww = (rl // 16) * wpr + j
-                tot = tot + lds_ld(red, (ww * 64 + n + 16 * (r // 4)) * 4 + r % 4)
-            emit(rl, n, tot)
+            emit(rl, n, _wave_total(rule, _wave_parts(red, wpr, rl, n, r)))
 
 
 def emit_out(st, stride):
@@ -655,12 +707,24 @@ def owner_peer_reduce(st, region_base, t, residual, out_fn, tile, *, r_peers=Non
 
 @traced
 def peer_reduce(
-    st, region, t, residual, out_fn, tile=ROW_TILE, *, owner_reduce=False, r_peers=None
+    st,
+    region,
+    t,
+    residual,
+    out_fn,
+    tile=ROW_TILE,
+    *,
+    owner_reduce=False,
+    r_peers=None,
+    residual_f32=False,
 ):
     """Push BF16 partials in tagged pairs to every peer, then sum all ranks' pairs from the own
-    symmetric buffer in rank order (W = 1: no exchange). ``residual`` is fn(s, row) -> (r0, r1)
-    (plain loads, issued first), a mailbox base (pairs s * HIDDEN + row, polled with the peers),
-    or None when the caller adds its own. With ``peer_slot`` consecutive epochs use alternating
+    symmetric buffer in rank order (W = 1: no exchange). As aiter's fused all-reduce + RMSNorm, the
+    rank sum is rounded to bf16 before the residual joins in f32: out_fn(s, row, v0, v1) gets
+    ``residual + bf16(sum)``, unrounded. ``residual`` is fn(s, row) -> (r0, r1) (plain loads, issued
+    first), a mailbox base (pairs s * HIDDEN + row, polled with the peers; with ``residual_f32`` one f32 a
+    pair, the residual its bf16 rounding), or None when the caller adds its own. With ``peer_slot``
+    consecutive epochs use alternating
     ``_part_stride`` slots: a rank cannot finish epoch k + 1 before every peer enters it, so no
     rank reaches k + 2 soon enough to overwrite epoch k while it is still being consumed. With
     ``owner_reduce`` each tile is summed once by the rank that owns its rows and sent back.
@@ -715,27 +779,35 @@ def peer_reduce(
             r0, r1 = residual(s, row)
         v0 = lds_ld(outs, s * tile + r)
         v1 = lds_ld(outs, s * tile + r + 1)
+        res_spec = []
+        if const_expr(residual is not None and not callable(residual)):
+            res_spec = [
+                (
+                    (residual, s * HIDDEN + row, 2)
+                    if residual_f32
+                    else (residual, (s * HIDDEN + row) // 2, 1)
+                )
+            ]
         if const_expr(W == 1):
             parts = [(v0, v1)]
-            got = []
-            if const_expr(residual is not None and not callable(residual)):
-                got = poll([(residual, (s * HIDDEN + row) // 2, 1)])
+            got = poll(res_spec) if res_spec else []
         else:
             own = sym + region_base
             specs = [(own, ((src * S + s) * HIDDEN + row) // 2, 1) for src in range(W)]
-            if const_expr(residual is not None and not callable(residual)):
-                specs.append((residual, (s * HIDDEN + row) // 2, 1))
-            got = poll(specs, "one-as")
+            got = poll(specs + res_spec, "one-as")
             parts = [bf2_f32(v[0]) for v in got[:W]]
             got = got[W:]
-        if const_expr(residual is not None and not callable(residual)):
+        if const_expr(res_spec and residual_f32):
+            r0 = bf16_round(got[0][0].bitcast(fx.Float32))
+            r1 = bf16_round(got[0][1].bitcast(fx.Float32))
+        elif const_expr(res_spec):
             r0, r1 = bf2_f32(got[0][0])
         t0 = fx.Float32(0.0)
         t1 = fx.Float32(0.0)
         for src in range_constexpr(W):
             t0 = t0 + parts[src][0]
             t1 = t1 + parts[src][1]
-        out_fn(s, row, r0 + t0, r1 + t1)
+        out_fn(s, row, r0 + bf16_round(t0), r1 + bf16_round(t1))
 
 
 HELPERS = (

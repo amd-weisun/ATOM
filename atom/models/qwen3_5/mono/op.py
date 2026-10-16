@@ -55,7 +55,9 @@ class Qwen35Variant:
         self.replay_cap = replay_cap
         dims = shape_dims(cfg)
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.scr_layout, self.sym_layout = layout(samples, npes, full, **dims)
+        self.scr_layout, self.sym_layout = layout(
+            samples, npes, full, tokens_per_seq=tokens_per_seq, **dims
+        )
         self.scratch = torch.zeros(
             self.scr_layout["_bytes"], dtype=torch.uint8, device=dev
         )
@@ -148,7 +150,9 @@ class Qwen35MonoKernel:
         layer=0,
         advance=True,
     ):
-        """One layer on the residual ``h`` [S, hidden] bf16; updates the state in place.
+        """One layer on the residual stream ``h`` [S, hidden] f32 -> the next layer's; updates the state in
+        place. The stream is the value aiter's fused all-reduce RMSNorm normalizes (``residual +
+        bf16(rank sum)``, unrounded); its bf16 rounding is the residual ATOM stores.
 
         GDN: ``gdn_state = (conv_state, ssm_state, slots_in, slots_out)``; an MTP verify variant
         (``tokens_per_seq`` T > 1) takes ``(conv_state, ssm_state, n_accepted, spec_slots)``: per sequence the
@@ -163,11 +167,11 @@ class Qwen35MonoKernel:
         cfg, S = self.W.cfg, self.S
         if (
             tuple(h.shape) != (S, cfg.hidden)
-            or h.dtype != torch.bfloat16
+            or h.dtype != torch.float32
             or not h.is_contiguous()
         ):
             raise ValueError(
-                f"h must be contiguous bfloat16 {(S, cfg.hidden)}, got {tuple(h.shape)} {h.dtype}"
+                f"h must be contiguous float32 {(S, cfg.hidden)}, got {tuple(h.shape)} {h.dtype}"
             )
 
         def i32(name, t, shape):
