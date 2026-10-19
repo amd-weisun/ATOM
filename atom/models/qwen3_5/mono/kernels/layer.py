@@ -57,6 +57,7 @@ from atom.models.qwen3_5.mono.layout import (
     pa_splits,
     router_rows,
     stage_tasks,
+    xin_stage,
 )
 
 _CURRENT_STREAM = fx.Stream(None)
@@ -129,6 +130,7 @@ def build_qwen35_kernel(
     ID_BITS = max(8, (N_EXPERTS - 1).bit_length())
     ID_MASK = (1 << ID_BITS) - 1
     XQ_BLOCKS = HIDDEN // 128
+    XIN = xin_stage(S, WFMT)  # the input norm + FP8 quant once a layer (stage xin)
     PUBLISH_BLOCKS = XQ_BLOCKS
     XQ_WAVES = (PUBLISH_BLOCKS + N_ROUTER - 1) // N_ROUTER
     assert XQ_WAVES <= WAVES

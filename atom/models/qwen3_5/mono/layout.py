@@ -90,6 +90,16 @@ BF16_GEMM_RULES = {
 }
 
 
+# Past XIN_MIN rows the FP8 checkpoint's input norm + FP8 quant runs once a layer (stage ``xin``, a task per row)
+# instead of in every projection task (each restaged every row: the cost grew with the rows)
+XIN_MIN = 4
+
+
+def xin_stage(S: int, weights: str) -> bool:
+    """Whether the layer quantizes its input once (stage ``xin``) for the FP8 projections."""
+    return weights == "fp8" and S >= XIN_MIN
+
+
 def baseline_m(S: int, tokens_per_seq: int = 1) -> int:
     """The M of baseline ATOM's decode GEMMs for an S-row step: CUDA graphs pad a plain decode batch to
     its capture size (1 .. 8, then multiples of 16); an MTP verify's batch (at most 4 requests) is
@@ -187,8 +197,15 @@ def layout(
             ("gq", S * out_k(full, dims) // 4 * pr),
             ("gqs", S * out_k(full, dims) // 128 * pr),
         ]
+    # stage xin's output: the normed input as FP8 (four bytes a pair) and its per-128 scales
+    xin = (
+        [("xinq", S * hidden // 4 * pr), ("xins", S * hidden // 128 * pr)]
+        if xin_stage(S, weights)
+        else []
+    )
     items = (
-        mixer
+        xin
+        + mixer
         + out_in
         + [
             # the f32 post-mixer stream (one value a pair): the MoE input norm's operand
@@ -240,6 +257,7 @@ def stage_tasks(
     tokens_per_seq=1,
 ):
     """[(stage name, task count)] in execution order (``tokens_per_seq``: MTP verify, a GDN task per sequence)."""
+    xin = [("xin", S)] if xin_stage(S, weights) else []
     if full:
         mixer = [
             ("proj", (heads * 2 * head_dim + 2 * head_dim) // PROJ_TILE // PROJ_GROUPS),
@@ -254,14 +272,19 @@ def stage_tasks(
             ("proj_ba", -(-(2 * hv // PROJ_TILE) // PROJ_GROUPS)),
             ("gdn", S // tokens_per_seq * hv),
         ]
-    return mixer + [
-        ("out", hidden // ROW_TILE),
-        # SPT samples per task; an odd S leaves the last task a sample short (masked)
-        (
-            "router",
-            -(-S // router_spt(S, n_experts)) * (router_rows(n_experts) // ROUTER_TILE),
-        ),
-        # one tile per (routed slot, 8 intermediates); the first inter / UG8 also carry the shared expert
-        ("ug", S * top_k * (inter // UG8)),
-        ("down", hidden // dn_tile(S, hidden)),
-    ]
+    return (
+        xin
+        + mixer
+        + [
+            ("out", hidden // ROW_TILE),
+            # SPT samples per task; an odd S leaves the last task a sample short (masked)
+            (
+                "router",
+                -(-S // router_spt(S, n_experts))
+                * (router_rows(n_experts) // ROUTER_TILE),
+            ),
+            # one tile per (routed slot, 8 intermediates); the first inter / UG8 also carry the shared expert
+            ("ug", S * top_k * (inter // UG8)),
+            ("down", hidden // dn_tile(S, hidden)),
+        ]
+    )

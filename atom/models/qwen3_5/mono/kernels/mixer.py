@@ -6,7 +6,7 @@ out_proj with the attention-side TP reduce."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from atom.models.qwen3_5.mono.kernels.common import (
@@ -34,6 +34,7 @@ def mixer_defs(ctx):
     HIDDEN = ctx["HIDDEN"]
     MX = ctx["MX"]
     S = ctx["S"]
+    XIN = ctx["XIN"]
     XQ_BLOCKS = ctx["XQ_BLOCKS"]
     layer = ctx["layer"]
     misc = ctx["misc"]
@@ -45,6 +46,10 @@ def mixer_defs(ctx):
     reduce_rows = ctx["reduce_rows"]
     run_units = ctx["run_units"]
     stage_x_gemma = ctx["stage_x_gemma"]
+    stage_x8 = ctx["stage_x8"]
+    put = ctx["put"]
+    mb = ctx["mb"]
+    xs = ctx["xs"]
     start = ctx["start"]
     tid = ctx["tid"]
     unit_bf16 = ctx["unit_bf16"]
@@ -75,6 +80,28 @@ def mixer_defs(ctx):
             res.append([v[j] for j in range(4)])
         return res
 
+    def xin_stage():
+        """Stage ``xin`` (past XIN_MIN rows): a task per row normalizes it and quantizes it to FP8 once, as each
+        projection task otherwise would (the same values and rounding), publishing the bytes (``xinq``) and
+        the per-128 scales (``xins``) the FP8 projections stage from."""
+        NQ, NB = HIDDEN // 4, HIDDEN // 128
+        for tt in range(start("xin"), S, G):
+            s = fx.Int32(tt)
+            gpu.barrier()
+            stage_x_gemma(
+                lambda sks: ld_h([(s, k) for _r, k in sks]),
+                HIDDEN,
+                g_in1,
+                count=1,
+                fp8_rule=input_quant,
+            )
+            gpu.barrier()
+            for i in range_constexpr(NQ // 512):
+                w = tid + i * 512
+                put(mb("xinq"), s * NQ + w, lds_ld(xs, w))
+            if tid < NB:
+                put(mb("xins"), s * NB + tid, lds_ld(misc, MOE_MISC + tid))
+
     def proj_stage(name, n_groups, w, sc, bf16_w, epilogue):
         """Stage ``name``: ``n_groups`` 16-row groups of FP8 (scales ``sc``) or BF16 matrix ``w``,
         PROJ_GROUPS per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows). An FP8
@@ -84,6 +111,8 @@ def mixer_defs(ctx):
         """
         r_w, r_s = rsrc(w), (None if bf16_w else rsrc(sc))
         a8 = not bf16_w and not MX
+        if const_expr(name == "proj" and XIN):
+            xin_stage()
         batch = max(1, NKC // WAVES // (4 if bf16_w else 1))  # units in flight per wave
         if const_expr(S > 8):  # past 8 samples the staged activations need the room
             batch = max(1, batch // 2)
@@ -115,7 +144,10 @@ def mixer_defs(ctx):
                 return unit_bf16_rows(r_w, rg, kc, HIDDEN, bw)  # MX: BF16 row-major
 
             pre = [u(c) for c in range(batch)]
-            stage_x_gemma(ld_h, HIDDEN, g_in1, fp8_rule=input_quant if a8 else None)
+            if const_expr(a8 and XIN):
+                stage_x8("xinq", "xins", HIDDEN, list(range(S)))
+            else:
+                stage_x_gemma(ld_h, HIDDEN, g_in1, fp8_rule=input_quant if a8 else None)
             gpu.barrier()
             acc = run_units(u, UPW8 if a8 else UPW, batch, pre)
             reduce_rows(PROJ_GROUPS, acc, emit_out(ROWS))
