@@ -109,19 +109,28 @@ def gdn_stages(ctx):
     ROWS = PROJ_TILE * PROJ_GROUPS
 
     # ================================ 1. qkv | z (FP8) and b | a (BF16) projections
-    def conv_epilogue(s, ch, v):
-        """Channel ``ch`` of sample ``s``: causal conv over the 3 stored inputs and ``v``, SiLU;
-        the state shifts to slots_out. A padded sample (negative slot) publishes 0."""
+    def conv_prefetch(s, row):
+        """``conv_epilogue``'s loads for sample ``s``, row ``row`` (the GEMM's z rows clamp to a
+        channel; their values go unused): the slots, the 3 stored inputs and the channel's taps.
+        """
+        ch = fx.min(row, CONV_DIM - 1)
         si = fx.Int32(bo.buffer_load(r_si, s, vec_width=1, dtype=T.i32))
         so = fx.Int32(bo.buffer_load(r_so, s, vec_width=1, dtype=T.i32))
-        ok = (si >= 0) & (so >= 0)
-        x = bf16_round(v)
         cs = [
             ld_bf16(r_conv, (fx.max(si, 0) * 3 + j) * CONV_DIM + ch) for j in range(3)
         ]
         wv = fx.Vector(bo.buffer_load(r_wc, ch * 4, vec_width=4, dtype=T.bf16)).to(
             fx.Float32
         )
+        return si, so, cs, wv
+
+    def conv_epilogue(s, ch, v, pf):
+        """Channel ``ch`` of sample ``s``: causal conv over the 3 stored inputs and ``v``, SiLU;
+        the state shifts to slots_out. A padded sample (negative slot) publishes 0. ``pf``:
+        ``conv_prefetch``'s loads, issued before the GEMM."""
+        si, so, cs, wv = pf
+        ok = (si >= 0) & (so >= 0)
+        x = bf16_round(v)
         # ATOM's causal_conv1d_update: each bf16 x bf16 tap product rounded to bf16, summed in f32, oldest first
         acc = (
             bf16_round(cs[0] * wv[0])
@@ -177,10 +186,10 @@ def gdn_stages(ctx):
                         (fx.max(so, 0) * CW + i) * CONV_DIM + ch,
                     )
 
-    def qkvz_epilogue(s, row, v):
+    def qkvz_epilogue(s, row, v, pf=None):
         if row < CONV_DIM:
             if const_expr(T_SEQ == 1):
-                conv_epilogue(s, row, v)
+                conv_epilogue(s, row, v, pf)
             else:
                 conv_epilogue_mtp(s, row, v)
         else:
@@ -193,6 +202,7 @@ def gdn_stages(ctx):
         s_qkvz,
         False,
         qkvz_epilogue,
+        prefetch=conv_prefetch if T_SEQ == 1 else None,
     )
     proj_stage(
         "proj_ba",

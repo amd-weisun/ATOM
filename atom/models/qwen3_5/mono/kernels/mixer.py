@@ -102,12 +102,13 @@ def mixer_defs(ctx):
             if tid < NB:
                 put(mb("xins"), s * NB + tid, lds_ld(misc, MOE_MISC + tid))
 
-    def proj_stage(name, n_groups, w, sc, bf16_w, epilogue):
+    def proj_stage(name, n_groups, w, sc, bf16_w, epilogue, prefetch=None):
         """Stage ``name``: ``n_groups`` 16-row groups of FP8 (scales ``sc``) or BF16 matrix ``w``,
         PROJ_GROUPS per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows). An FP8
         matrix runs W8A8 (aiter's blockscale GEMM): the input FP8 per 1x128, each 128-K block's partial
         times ``a_scale * w_scale``. An FP8 matrix of the MXFP4 checkpoint (``MX``) is BF16 there,
-        row-major as ATOM holds it.
+        row-major as ATOM holds it. ``prefetch(s, row)`` (every thread, s clamped) issues the epilogue's
+        loads before the GEMM; its result is the epilogue's fourth argument.
         """
         r_w, r_s = rsrc(w), (None if bf16_w else rsrc(sc))
         a8 = not bf16_w and not MX
@@ -144,6 +145,9 @@ def mixer_defs(ctx):
                 return unit_bf16_rows(r_w, rg, kc, HIDDEN, bw)  # MX: BF16 row-major
 
             pre = [u(c) for c in range(batch)]
+            # the epilogue's loads, ahead of the GEMM
+            if const_expr(prefetch is not None):
+                pf = prefetch(fx.min(tid // ROWS, S - 1), t * ROWS + tid % ROWS)
             if const_expr(a8 and XIN):
                 stage_x8("xinq", "xins", HIDDEN, list(range(S)))
             else:
@@ -153,7 +157,10 @@ def mixer_defs(ctx):
             reduce_rows(PROJ_GROUPS, acc, emit_out(ROWS))
             gpu.barrier()
             if tid < S * ROWS:
-                epilogue(tid // ROWS, t * ROWS + tid % ROWS, lds_ld(outs, tid))
+                if const_expr(prefetch is not None):
+                    epilogue(tid // ROWS, t * ROWS + tid % ROWS, lds_ld(outs, tid), pf)
+                else:
+                    epilogue(tid // ROWS, t * ROWS + tid % ROWS, lds_ld(outs, tid))
 
     return {"proj_stage": proj_stage}
 
