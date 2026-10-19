@@ -290,3 +290,27 @@ def test_draft_embeddings_keep_the_original_draft(monkeypatch):
     model._mono = SimpleNamespace(ready=lambda rows: True)
     out = model(_ids(4), _ids(4), torch.zeros(4, 8), inputs_embeds=torch.zeros(4, 8))
     assert out == "original"
+
+
+@pytest.mark.parametrize(
+    "bs, rows, t",
+    [
+        (1, 4, 4),  # the verify rows (MTP3: four a request)
+        (1, 1, 1),  # a later draft step
+        (4, 16, 4),
+        (4, 4, 1),
+        (5, 20, None),  # the target's verify is past a launch: ATOM's ...
+        (5, 5, None),  # ... and so is every draft step of the batch
+        (8, 8, None),
+        (16, 16, None),
+        (4, 8, None),  # neither shape
+    ],
+)
+def test_draft_steps_follow_the_verify_width(monkeypatch, bs, rows, t):
+    from atom.models.qwen3_5.mono import draft_runner
+
+    fwd = SimpleNamespace(context=SimpleNamespace(scheduled_bs=bs))
+    monkeypatch.setattr(draft_runner, "get_forward_context", lambda: fwd)
+    runner = object.__new__(draft_runner.Qwen35MonoDraftRunner)
+    runner.T = 4
+    assert runner.step_t(rows) == t

@@ -97,11 +97,14 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
 
     def step_t(self, rows: int) -> int | None:
         """This draft step's tokens a request: step 0 runs the verify rows, steps 1.. one row a
-        request; None for a step mono does not serve."""
+        request; None for a step mono does not serve. A batch whose verify is past MAX_TOKENS rows (the
+        target's verify is then ATOM's) keeps every draft step ATOM's too."""
         bs = get_forward_context().context.scheduled_bs
-        if rows == bs * self.T and rows <= MAX_TOKENS:
+        if bs * self.T > MAX_TOKENS:
+            return None
+        if rows == bs * self.T:
             return self.T
-        if rows == bs and rows <= MAX_TOKENS:
+        if rows == bs:
             return 1
         return None
 
