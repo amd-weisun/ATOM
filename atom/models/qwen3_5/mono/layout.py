@@ -166,11 +166,6 @@ def layout(
         mixer = [
             ("qg", S * heads * 2 * head_dim * pr),  # q | gate per head (bf16 values)
             ("kvr", S * 2 * head_dim * pr),  # raw k then v of this rank's kv head
-            ("q", S * heads * head_dim * pr),  # normed, rotated query
-            (
-                "kvnew",
-                S * (2 * head_dim + 2) * pr,
-            ),  # this token's K / V FP8 codes + their scales
             ("sp_out", S * ns * heads * head_dim // 2 * pr),  # each split's bf16 output
             ("sp_ml", S * ns * heads * 2 * pr),  # and its running max, exp sum
         ]
@@ -248,7 +243,6 @@ def mailbox_regions(S: int, full: bool, weights: str, npes: int) -> list[RegionD
         r += [RegionDecl(n, Space.SCRATCH, "xin") for n in ("xinq", "xins")]
     if full:
         r += [RegionDecl(n, Space.SCRATCH, "proj") for n in ("qg", "kvr")]
-        r += [RegionDecl(n, Space.SCRATCH, "qk") for n in ("q", "kvnew")]
         r += [RegionDecl(n, Space.SCRATCH, "split") for n in ("sp_out", "sp_ml")]
         r += [RegionDecl("gated", Space.SCRATCH, "merge")]
     else:
@@ -290,7 +284,6 @@ def stage_tasks(
     if full:
         mixer = [
             ("proj", (heads * 2 * head_dim + 2 * head_dim) // PROJ_TILE // PROJ_GROUPS),
-            ("qk", S * (heads + 1)),
             ("split", S * pa_splits(S // tokens_per_seq)),
             ("merge", S * heads),
         ]

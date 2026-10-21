@@ -34,9 +34,7 @@ from atom.mono.device.ops import (
     wave_sum,
     xshfl,
 )
-from atom.mono.device.sync import Addr
 from atom.mono.plan.execution import WAVES
-from atom.mono.plan.trace import Space
 
 
 @traced
@@ -57,7 +55,6 @@ def attn_stages(ctx):
     S = ctx["S"]
     T_SEQ = ctx["T_SEQ"]
     SCALE = ctx["SCALE"]
-    block_sum = ctx["block_sum"]
     block_tables = ctx["block_tables"]
     slot_mapping = ctx["slot_mapping"]
     bt_stride = ctx["bt_stride"]
@@ -76,7 +73,6 @@ def attn_stages(ctx):
     put = ctx["put"]
     put2 = ctx["put2"]
     put_bf = ctx["put_bf"]
-    red = ctx["red"]
     rope_cos = ctx["rope_cos"]
     rope_sin = ctx["rope_sin"]
     s_qkv = ctx["s_qkv"]
@@ -131,97 +127,52 @@ def attn_stages(ctx):
 
     proj_stage("proj", (QG + 2 * KVD) // PROJ_TILE, w_qkv, s_qkv, False, qkv_epilogue)
 
-    # ================================ 2. Gemma q / k norm, partial RoPE; K / V -> the paged FP8 cache
-    # task j < H: query head j; j == H: this rank's K / V head (one: local_kv_heads == 1)
+    # ================================ 2. Gemma q / k norm, partial RoPE, K / V FP8 (in each split task)
+    # One wave a head, lane l holding dims l + 64 k: the sums of squares per 64 dims in dim order (the
+    # block sum's), the RoPE partner lane l ^ 32, the KV amax a wave max -- the same values the original's
+    # q / k norm + RoPE and cache-quant kernels produce, with no hand-off of their own.
     r_cos, r_sin, r_gq, r_gk = rsrc(rope_cos), rsrc(rope_sin), rsrc(g_qn1), rsrc(g_kn1)
     HALF = ROPE // 2
+    assert ROPE == 64 and HD == 4 * 64, "RoPE dims are lane l of k = 0, partner l ^ 32"
 
-    def block_max(v):
-        w = wave_max(v)
-        if lane == 0:
-            lds_st(red, wave, w)
-        gpu.barrier()
-        t = lds_ld(red, 0)
-        for i in range_constexpr(1, WAVES):
-            t = fx.max(t, lds_ld(red, i))
-        gpu.barrier()
-        return t
+    def norm_rope(xk, gam_r, pos):
+        """A head (this wave's dims lane + 64 k) -> (y_f, y): the Gemma norm, then RoPE, rounded to bf16
+        between (the original's two kernels) or once after (QKF: its fused kernel)."""
+        ss = [wave_sum(x * x) for x in xk]
+        rstd = rsq((((ss[0] + ss[1]) + ss[2]) + ss[3]) * (1.0 / HD) + EPS)
+        xn = [xk[k] * rstd * ld_f32(gam_r, lane + 64 * k) for k in range(4)]
+        if const_expr(not QKF):
+            xn = [bf16_round(v) for v in xn]
+        partner = xshfl(xn[0], 32)
+        cs = ld_f32(r_cos, pos * HALF + lane % HALF)
+        sn = ld_f32(r_sin, pos * HALF + lane % HALF)
+        rot = (lane < HALF).select(xn[0] * cs - partner * sn, xn[0] * cs + partner * sn)
+        y_f = [rot] + xn[1:]
+        return y_f, [bf16_round(v) for v in y_f]
 
-    def kv_quant(x, live):
-        """Per-token FP8 E4M3 over the head as the original path writes it -> (FP8 value as f32, scale,
-        the FP8 word). aiter's ``reshape_and_cache``: the scale ``amax / 448`` (stored as is: 0 for an
+    def kv_quant(xk):
+        """Per-token FP8 E4M3 of a head as the original path writes it -> ([FP8 value as f32], scale,
+        [FP8 word]). aiter's ``reshape_and_cache``: the scale ``amax / 448`` (stored as is: 0 for an
         all-zero head), x times ``1 / max(scale, 1e-12)``; ATOM's fused q / k norm + RoPE + cache kernel
         (QKF): ``amax / 448`` (1 for an all-zero head), x divided by it."""
-        amax = block_max(live.select(fmath.absf(x), fx.Float32(0.0)))
+        a = [fmath.absf(x) for x in xk]
+        amax = wave_max(fx.max(fx.max(a[0], a[1]), fx.max(a[2], a[3])))
         sc = amax / FP8_MAX
         if const_expr(QKF):
             sc = (sc == 0.0).select(fx.Float32(1.0), sc)
-            q = x / sc
-        else:
-            q = x * (1.0 / fx.max(sc, fx.Float32(1.0e-12)))
-        word = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q, q, fx.Int32(0), False))
-        v2 = fx.Vector.make_type(2, fx.Float32)
-        q8 = fx.Vector(rocdl.cvt_pk_f32_fp8(res=v2, src=word, word_sel=False))[0]
-        return q8, sc, word
-
-    for tt in range(start("qk"), S * (H + 1), G):
-        tt = fx.Int32(tt)
-        s = tt // (H + 1)
-        j = tt % (H + 1)
-        is_kv = j == H
-        gpu.barrier()
-        pos = ld_pos(s)
-        live = tid < HD
-        d = fx.min(tid, HD - 1)
-        # q / gate rows (qg) or the K / V rows (kvr): one address, the region named by the q tasks
-        src = Addr("qg", Space.SCRATCH, is_kv.select(mb("kvr").value, mb("qg").value))
-        idx = is_kv.select(s * 2 * KVD + d, s * QG + j * 2 * HD + d)
-        gam = is_kv.select(ld_f32(r_gk, d), ld_f32(r_gq, d))
-        got = poll([(src, idx, 1), (mb("kvr"), s * 2 * KVD + KVD + d, 1)])
-        x = got[0][0].bitcast(fx.Float32)
-        vraw = got[1][0].bitcast(fx.Float32)
-        rstd = rsq(block_sum(live.select(x * x, fx.Float32(0.0))) * (1.0 / HD) + EPS)
-        # the Gemma norm, then RoPE: rounded to bf16 between (the original's two kernels), or once after
-        # (QKF: its fused kernel, which also quantizes K for the cache from the unrounded value)
-        xn = x * rstd * gam
-        if const_expr(not QKF):
-            xn = bf16_round(xn)
-        lds_st(outs, d, xn)
-        gpu.barrier()
-        partner = lds_ld(outs, (d < HALF).select(d + HALF, d - HALF))
-        cs = ld_f32(r_cos, pos * HALF + d % HALF)
-        sn = ld_f32(r_sin, pos * HALF + d % HALF)
-        rot = (d < HALF).select(xn * cs - partner * sn, xn * cs + partner * sn)
-        y_f = (d < ROPE).select(rot, xn)
-        y = bf16_round(y_f)
-        if live & (j < H):
-            put(mb("q"), (s * H + j) * HD + d, y)
-        if is_kv:
-            k8, ksc, kword = kv_quant(y_f if QKF else y, live)
-            v8, vsc, vword = kv_quant(vraw, live)
-            # the token's cache slot (block * BS + offset) is the engine's; -1 = a padding row: no write
-            slot = uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32))
-            blk = slot // BS
-            t = slot % BS
-            if live & (slot >= 0):
-                kb = arith.trunci(T.i8, fx.Int32(kword).ir_value())
-                vb = arith.trunci(T.i8, fx.Int32(vword).ir_value())
-                bo.buffer_store(
-                    kb, kv_block(k_cache, blk), ((d // 16) * BS + t) * 16 + d % 16
-                )
-                bo.buffer_store(
-                    vb, kv_block(v_cache, blk), ((t // 16) * HD + d) * 16 + t % 16
-                )
-            if live:
-                # this launch's row for the split tasks: other CTAs may not see the cache stores yet
-                put(mb("kvnew"), s * (2 * HD + 2) + d, k8)
-                put(mb("kvnew"), s * (2 * HD + 2) + HD + d, v8)
-            if (tid == 0) & (slot >= 0):
-                bo.buffer_store(ksc, r_ks, blk * BS + t)
-                bo.buffer_store(vsc, r_vs, blk * BS + t)
-            if tid == 0:
-                put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD, ksc)
-                put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD + 1, vsc)
+        q8s, words = [], []
+        for x in xk:
+            if const_expr(QKF):
+                q = x / sc
+            else:
+                q = x * (1.0 / fx.max(sc, fx.Float32(1.0e-12)))
+            word = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q, q, fx.Int32(0), False))
+            v2 = fx.Vector.make_type(2, fx.Float32)
+            q8s.append(
+                fx.Vector(rocdl.cvt_pk_f32_fp8(res=v2, src=word, word_sel=False))[0]
+            )
+            words.append(word)
+        return q8s, sc, words
 
     # ================================ 3. split attention (aiter's pa_decode_gluon, FP8 compute)
     # Baseline ATOM's decode attention, rounding point for rounding point (spec: aiter's
@@ -231,8 +182,8 @@ def attn_stages(ctx):
     # the score (scale * k_scale) * dot, an online softmax in exp2, P' = FP8(v_scale * (448 / vmax) * p)
     # with vmax the partition's largest V scale, and P' x V on FP8 MFMAs (keys in order) times vmax / 448.
     # A split publishes its bf16 output and its (max, exp sum). Task = (row, split): the row's 8 heads are
-    # the MFMA's rows. This launch's keys (positions pos0 ..) come from ``kvnew``: other CTAs may not see
-    # their cache stores yet.
+    # the MFMA's rows. This launch's keys (positions pos0 ..) are the task's own (stage 2): other CTAs may
+    # not see the cache stores yet.
     MASKV = -3.4e38
     # rows padded off the 64-word stride: the 16 lanes of an MFMA operand / score row group would hit one
     # LDS bank (an even pad keeps the 8-byte operand loads aligned)
@@ -333,14 +284,70 @@ def attn_stages(ctx):
         # the verify path's live values spills SGPRs into a scratch slot
         PIPE = T_SEQ == 1
         raw0 = raw_loads(p0 * CPS) if PIPE else []
+        # this wave's query head and, for waves < 2 T_SEQ, this launch's token K / V (wave 2 i: K of token
+        # i, 2 i + 1: its V), normed / rotated / quantized here; f32 values to LDS, then packed
+        hk = poll(
+            [(mb("qg"), s * QG + wave * 2 * HD + lane + 64 * k, 1) for k in range(4)]
+        )
+        _qf, qy = norm_rope([v[0].bitcast(fx.Float32) for v in hk], r_gq, ld_pos(s))
+        for k in range_constexpr(4):
+            lds_st(outs, wave * HD + lane + 64 * k, qy[k])
+        if wave < 2 * T_SEQ:
+            ti = wave // 2
+            is_v = wave % 2 == 1
+            kvb = (s0 + ti) * 2 * KVD
+            got = poll(
+                [
+                    (
+                        mb("kvr"),
+                        kvb + is_v.select(fx.Int32(KVD), fx.Int32(0)) + lane + 64 * k,
+                        1,
+                    )
+                    for k in range(4)
+                ]
+            )
+            raw = [v[0].bitcast(fx.Float32) for v in got]
+            kf, ky = norm_rope(raw, r_gk, ld_pos(s0 + ti))
+            src = [is_v.select(raw[k], kf[k] if QKF else ky[k]) for k in range(4)]
+            q8s, sc, words = kv_quant(src)
+            for k in range_constexpr(4):
+                lds_st(xs, XS + wave * HD + lane + 64 * k, q8s[k])
+            if lane == 0:
+                lds_st(xs, XSN + 2 * ti + is_v.select(fx.Int32(1), fx.Int32(0)), sc)
+            # the row's own token goes to the cache once: by its first split
+            slot = uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32))
+            blk = slot // BS
+            t_ = slot % BS
+            if (js == 0) & (s0 + ti == s) & (slot >= 0):
+                for k in range_constexpr(4):
+                    d = lane + 64 * k
+                    b8 = arith.trunci(T.i8, fx.Int32(words[k]).ir_value())
+                    # the block's own base (slot is wave-uniform): the pool passes 4 GiB
+                    if is_v:
+                        bo.buffer_store(
+                            b8,
+                            kv_block(v_cache, blk),
+                            ((t_ // 16) * HD + d) * 16 + t_ % 16,
+                        )
+                    else:
+                        bo.buffer_store(
+                            b8,
+                            kv_block(k_cache, blk),
+                            ((d // 16) * BS + t_) * 16 + d % 16,
+                        )
+                if lane == 0:
+                    if is_v:
+                        bo.buffer_store(sc, r_vs, blk * BS + t_)
+                    else:
+                        bo.buffer_store(sc, r_ks, blk * BS + t_)
+        gpu.barrier()
         # Q -> FP8 bytes (unscaled), heads >= H zero; P' rows >= H zero
-        qv = poll([(mb("q"), s * H * HD + 4 * tid + 2 * i, 2) for i in range(2)])
         lds_st(
             xs,
             XQ8 + (tid // (HD // 4)) * SQ8 + tid % (HD // 4),
-            fp8_word(
-                *[qv[i][e].bitcast(fx.Float32) for i in range(2) for e in range(2)]
-            ).bitcast(fx.Float32),
+            fp8_word(*[lds_ld(outs, 4 * tid + e) for e in range(4)]).bitcast(
+                fx.Float32
+            ),
         )
         lds_st(
             xs, XQ8 + (H + tid // (HD // 4)) * SQ8 + tid % (HD // 4), fx.Float32(0.0)
@@ -351,27 +358,19 @@ def attn_stages(ctx):
                 XPP + (H + tid // (CPS // 4)) * SPP + tid % (CPS // 4),
                 fx.Float32(0.0),
             )
-        # this launch's keys, for every split with a tile (their V scales enter the tile's vmax, their
-        # P' = 0 products the split's sums): K / V codes (exact FP8 values) back to bytes
-        if (npart > 0) & (tid < T_SEQ * 2 * HD // 4):
+        # this launch's K / V codes (exact FP8 values) back to bytes: [K | V][token][HD / 4 words]
+        if tid < T_SEQ * 2 * HD // 4:
             i_ = tid // (2 * HD // 4)
             kv_ = (tid // (HD // 4)) % 2
             d4 = (tid % (HD // 4)) * 4
-            base = (s0 + i_) * (2 * HD + 2) + kv_ * HD + d4
-            got = poll([(mb("kvnew"), base, 2), (mb("kvnew"), base + 2, 2)])
             w = fp8_word(
-                *[got[i][e].bitcast(fx.Float32) for i in range(2) for e in range(2)]
+                *[lds_ld(xs, XS + (2 * i_ + kv_) * HD + d4 + e) for e in range(4)]
             )
             lds_st(
                 xs,
                 XKN + kv_ * (T_SEQ * HD // 4) + i_ * (HD // 4) + d4 // 4,
                 w.bitcast(fx.Float32),
             )
-        if (npart > 0) & (tid < 2 * T_SEQ):
-            sc2 = poll(
-                [(mb("kvnew"), (s0 + tid // 2) * (2 * HD + 2) + 2 * HD + tid % 2, 1)]
-            )
-            lds_st(xs, XSN + tid, sc2[0][0].bitcast(fx.Float32))
         gpu.barrier()
 
         def key_patch(t, cached, odd):
