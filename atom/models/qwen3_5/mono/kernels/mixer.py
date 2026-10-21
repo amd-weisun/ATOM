@@ -58,10 +58,6 @@ def mixer_defs(ctx):
     wave = ctx["wave"]
     r_h = rsrc(h_in)
     NKC = HIDDEN // 64
-    WPR = WAVES // PROJ_GROUPS
-    UPW = NKC // WPR
-    UPW8 = HIDDEN // 128 // WPR  # 128-K units of an FP8 matrix per wave
-    ROWS = PROJ_TILE * PROJ_GROUPS
     first = layer == 0
 
     def input_quant(amax):
@@ -102,14 +98,19 @@ def mixer_defs(ctx):
             if tid < NB:
                 put(mb("xins"), s * NB + tid, lds_ld(misc, MOE_MISC + tid))
 
-    def proj_stage(name, n_groups, w, sc, bf16_w, epilogue, prefetch=None):
+    def proj_stage(
+        name, n_groups, w, sc, bf16_w, epilogue, prefetch=None, groups=PROJ_GROUPS
+    ):
         """Stage ``name``: ``n_groups`` 16-row groups of FP8 (scales ``sc``) or BF16 matrix ``w``,
-        PROJ_GROUPS per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows). An FP8
+        ``groups`` per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows). An FP8
         matrix runs W8A8 (aiter's blockscale GEMM): the input FP8 per 1x128, each 128-K block's partial
         times ``a_scale * w_scale``. An FP8 matrix of the MXFP4 checkpoint (``MX``) is BF16 there,
         row-major as ATOM holds it. ``prefetch(s, row)`` (every thread, s clamped) issues the epilogue's
-        loads before the GEMM; its result is the epilogue's fourth argument.
+        loads before the GEMM; its result is the epilogue's fourth argument. A task's waves split K
+        evenly between its groups.
         """
+        wpr = WAVES // groups
+        upw, upw8, rows = NKC // wpr, HIDDEN // 128 // wpr, PROJ_TILE * groups
         r_w, r_s = rsrc(w), (None if bf16_w else rsrc(sc))
         a8 = not bf16_w and not MX
         if const_expr(name == "proj" and XIN):
@@ -119,14 +120,14 @@ def mixer_defs(ctx):
             batch = max(1, batch // 2)
         if const_expr(a8):  # a 128-K unit loads what two 64-K units did
             batch = max(1, batch // 2)
-        for t in range(start(name), n_groups // PROJ_GROUPS, G):
+        for t in range(start(name), n_groups // groups, G):
             t = fx.Int32(t)
             gpu.barrier()
-            rg = t * PROJ_GROUPS + wave // WPR
+            rg = t * groups + wave // wpr
 
             def u(c):
                 if const_expr(a8):
-                    kb = (wave % WPR) * UPW8 + c
+                    kb = (wave % wpr) * upw8 + c
                     sn = n_sel()
                     return unit_f8f8(
                         r_w,
@@ -138,7 +139,7 @@ def mixer_defs(ctx):
                         sn * (HIDDEN // 4) + kb * 32,
                         lambda: lds_ld(misc, MOE_MISC + sn * XQ_BLOCKS + kb),
                     )
-                kc = (wave % WPR) * UPW + c
+                kc = (wave % wpr) * upw + c
                 bw = (n_sel() * HIDDEN + kc * 64) // 2
                 if const_expr(bf16_w):
                     return unit_bf16(r_w, rg, kc, NKC, bw)
@@ -147,20 +148,20 @@ def mixer_defs(ctx):
             pre = [u(c) for c in range(batch)]
             # the epilogue's loads, ahead of the GEMM
             if const_expr(prefetch is not None):
-                pf = prefetch(fx.min(tid // ROWS, S - 1), t * ROWS + tid % ROWS)
+                pf = prefetch(fx.min(tid // rows, S - 1), t * rows + tid % rows)
             if const_expr(a8 and XIN):
                 stage_x8("xinq", "xins", HIDDEN, list(range(S)))
             else:
                 stage_x_gemma(ld_h, HIDDEN, g_in1, fp8_rule=input_quant if a8 else None)
             gpu.barrier()
-            acc = run_units(u, UPW8 if a8 else UPW, batch, pre)
-            reduce_rows(PROJ_GROUPS, acc, emit_out(ROWS))
+            acc = run_units(u, upw8 if a8 else upw, batch, pre)
+            reduce_rows(groups, acc, emit_out(rows))
             gpu.barrier()
-            if tid < S * ROWS:
+            if tid < S * rows:
                 if const_expr(prefetch is not None):
-                    epilogue(tid // ROWS, t * ROWS + tid % ROWS, lds_ld(outs, tid), pf)
+                    epilogue(tid // rows, t * rows + tid % rows, lds_ld(outs, tid), pf)
                 else:
-                    epilogue(tid // ROWS, t * ROWS + tid % ROWS, lds_ld(outs, tid))
+                    epilogue(tid // rows, t * rows + tid % rows, lds_ld(outs, tid))
 
     return {"proj_stage": proj_stage}
 

@@ -206,6 +206,8 @@ def gdn_stages(ctx):
         None,
         True,
         lambda s, row, v: put(mb("ba"), s * 2 * HV + row, bf16_round(v)),
+        # a row group a task: the gdn tasks wait on these rows, so they stream on two CTAs
+        groups=1,
     )
 
     # ================================ 2. gated delta rule + gated RMSNorm (one task per sample x v-head)

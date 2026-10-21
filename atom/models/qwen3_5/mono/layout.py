@@ -298,7 +298,7 @@ def stage_tasks(
         g = gdn_dims({"hk": hk, "hv": hv, "k_dim": k_dim, "v_dim": v_dim})
         mixer = [
             ("proj", (g["conv_dim"] + g["value_dim"]) // PROJ_TILE // PROJ_GROUPS),
-            ("proj_ba", -(-(2 * hv // PROJ_TILE) // PROJ_GROUPS)),
+            ("proj_ba", 2 * hv // PROJ_TILE),  # a row group a task
             ("gdn", S // tokens_per_seq * hv),
         ]
     return (

@@ -124,9 +124,7 @@ def build_qwen35_kernel(
     assert (CONV_DIM + VALUE_DIM) % (PROJ_TILE * PROJ_GROUPS) == 0 and CONV_DIM % (
         PROJ_TILE * PROJ_GROUPS
     ) == 0
-    assert (2 * HV) % (
-        PROJ_TILE * PROJ_GROUPS
-    ) == 0, "b | a rows must fill whole proj tasks"
+    assert (2 * HV) % PROJ_TILE == 0, "b | a rows must fill whole row groups"
     assert VALUE_DIM % 256 == 0 and HIDDEN % ROW_TILE == 0
     N_EXPERTS, TOP_K, INTER = n_experts, top_k, inter
     # "mxfp4": BF16 projections, MXFP4 routed experts on MXFP4 activations (A4W4), a BF16 shared expert
