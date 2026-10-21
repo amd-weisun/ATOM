@@ -145,11 +145,12 @@ class Dims:
 
 def final_norm(norm, x):
     """Gemma RMSNorm of the f32 residual stream ``x`` -> bf16: ``x * rsqrt(mean(x^2) + eps) * (1 + w)``
-    in f32, rounded once (the original path's fused all-reduce norm on ``residual + bf16(sum)``).
+    in f32, rounded once (the original path's fused all-reduce norm on ``residual + bf16(sum)``), one
+    launch (``kernels.final_norm``).
     """
-    return norm.forward_static(norm.weight.data, norm.variance_epsilon, x, None).to(
-        torch.bfloat16
-    )
+    from atom.models.qwen3_5.mono.kernels.final_norm import final_norm as launch
+
+    return launch(norm, x)
 
 
 def spec_steps(atom_config) -> int:
